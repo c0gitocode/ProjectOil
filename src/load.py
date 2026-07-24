@@ -4,13 +4,12 @@ import pandas as pd
 from config import PROCESSED_DIR
 
 
-def load_data_to_sqlite():
+def load_data_to_sqlite() -> None:
     db_path = os.path.join(PROCESSED_DIR, "oil_database.db")
     print("[*] Load katmanı: Veriler SQLite veritabanına yükleniyor...")
 
     conn = sqlite3.connect(db_path)
 
-    # Yüklenecek dosya ve tablo eşleşmeleri
     files_to_load = {
         "master_analysis": "MASTER_ANALYSIS.csv",
         "china_imports": "china_oil_imports_processed.csv",
@@ -26,17 +25,14 @@ def load_data_to_sqlite():
         if os.path.exists(file_path):
             try:
                 df = pd.read_csv(file_path)
-                # Tabloyu veritabanına yaz (varsa üzerine yaz)
                 df.to_sql(table_name, conn, if_exists='replace', index=False)
-                print(f"[+] Tablo güncellendi/oluşturuldu: {table_name} ({len(df)} satır)")
+                print(f"[+] Tablo güncellendi: {table_name} ({len(df)} satır)")
                 loaded_count += 1
             except Exception as e:
                 print(f"[!] Hata ({table_name}): {e}")
-        else:
-            print(f"[-] Dosya bulunamadı, atlanıyor: {file_name}")
 
     conn.close()
-    print(f"[+] Load katmanı tamamlandı. Toplam {loaded_count} tablo veritabanına işlendi: {db_path}")
+    print(f"[+] Load katmanı tamamlandı. Toplam {loaded_count} tablo işlendi: {db_path}")
 
 
 if __name__ == "__main__":
