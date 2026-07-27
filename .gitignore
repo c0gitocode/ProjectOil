@@ -7,6 +7,7 @@ __pycache__/
 data/raw/*
 data/processed/*
 outputs/*
+outputs/*.png
 
 !data/raw/.gitkeep
 !data/processed/.gitkeep

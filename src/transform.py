@@ -86,6 +86,7 @@ def master_analiz_olustur() -> None:
 # ---------------------------------------------------------
 # 2. ÇİN / GÜMRÜK VERİSİ İŞLEME (TÜM ÜLKELER DAHİL)
 # ---------------------------------------------------------
+
 def process_china_oil_data() -> bool:
     print("[*] Çin ham petrol ithalat verileri işleniyor...")
     file_list = glob.glob(os.path.join(RAW_DIR, "china", "*_china.csv"))
@@ -112,13 +113,18 @@ def process_china_oil_data() -> bool:
 
     for col in numeric_cols:
         if col in df_raw.columns:
-            df_raw[col] = pd.to_numeric(df_raw[col].astype(str).str.replace(',', '', regex=False).str.strip(),
-                                        errors='coerce').fillna(0.0)
+            # Sütunları zorunlu olarak float formatına dönüştürüyoruz
+            df_raw[col] = pd.to_numeric(
+                df_raw[col].astype(str).str.replace(',', '', regex=False).str.strip(),
+                errors='coerce'
+            ).astype(float).fillna(0.0)
 
-    # Vektörel atama
-    mask = (df_raw.get('Supplementary Quantity', 0) == 0) | (
-        df_raw.get('Supplementary Quantity', pd.Series(dtype=float)).isna())
+    # Güvenli vektörel atama işlemi
+    if 'Supplementary Quantity' not in df_raw.columns:
+        df_raw['Supplementary Quantity'] = 0.0
+
     if 'Quantity' in df_raw.columns:
+        mask = (df_raw['Supplementary Quantity'] == 0.0) | df_raw['Supplementary Quantity'].isna()
         df_raw.loc[mask, 'Supplementary Quantity'] = df_raw.loc[mask, 'Quantity'] * 0.00733
 
     df_raw = df_raw[df_raw['Trading partner'] != 'World']
@@ -129,11 +135,12 @@ def process_china_oil_data() -> bool:
 
     df_final = pd.concat([df_raw, df_world], ignore_index=True).sort_values(
         by=['Date of data', 'Trading partner']).reset_index(drop=True)
+
     output_file = os.path.join(PROCESSED_DIR, "china_oil_imports_processed.csv")
     df_final.to_csv(output_file, index=False)
     print(f"[+] Çin verisi işlendi ve kaydedildi: {output_file}")
-    return True
 
+    return True
 
 # ---------------------------------------------------------
 # 3. HİNDİSTAN / DGCIS & JODI BİRLEŞTİRME VE DUYARLILIK
@@ -206,7 +213,6 @@ def process_india_oil_data() -> bool:
     df_final.to_csv(output_csv, index=False)
     print(f"[+] Hindistan duyarlılık analizi tamamlandı: {output_csv}")
     return True
-
 
 # ---------------------------------------------------------
 # 4. ÇİN ÖDEME DAĞILIMI (ENDONEZYA EKLENTİSİ & DİNAMİK ORANLAR)

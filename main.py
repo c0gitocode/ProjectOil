@@ -2,15 +2,17 @@ import time
 import sys
 import os
 
-# src klasörünü Python arama yoluna ekle
+# src klasörünü arama yoluna ekle
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
-from extract import jodi_guncelle, eia_guncelle, epdk_guncelle, dgcis_guncelle
-from transform import master_analiz_olustur, process_china_oil_data, process_india_oil_data, process_china_payment_breakdown, global_ikili_hegemonya_birlestir
+# gacc_guncelle import edildi
+from extract import jodi_guncelle, eia_guncelle, epdk_guncelle, dgcis_guncelle, gacc_guncelle
+from transform import (master_analiz_olustur, process_china_oil_data, process_india_oil_data,
+                       process_china_payment_breakdown, global_ikili_hegemonya_birlestir)
 from load import load_data_to_sqlite
+from utils import global_grafik_ciz
 
-
-def run_pipeline():
+def run_pipeline() -> None:
     start_time = time.time()
 
     print("=== 1. VERİ ÇEKME (EXTRACT) KATMANI BAŞLIYOR ===")
@@ -19,6 +21,7 @@ def run_pipeline():
         eia_guncelle()
         epdk_guncelle()
         dgcis_guncelle()
+        gacc_guncelle() # Çin veri çekme fonksiyonu eklendi
     except Exception as e:
         print(f"[!] Extract aşamasında hata: {e}")
 
@@ -26,9 +29,9 @@ def run_pipeline():
     try:
         master_analiz_olustur()
         process_china_oil_data()
-        process_china_payment_breakdown()  # Yeni eklenen Çin ödeme analizi
+        process_china_payment_breakdown()
         process_india_oil_data()
-        global_ikili_hegemonya_birlestir()  # Küresel birleştirme
+        global_ikili_hegemonya_birlestir()
     except Exception as e:
         print(f"[!] Transform aşamasında hata: {e}")
 
@@ -38,14 +41,14 @@ def run_pipeline():
     except Exception as e:
         print(f"[!] Load aşamasında hata: {e}")
 
+    print("\n=== 4. GÖRSELLEŞTİRME (UTILS) KATMANI BAŞLIYOR ===")
+    try:
+        global_grafik_ciz()
+    except Exception as e:
+        print(f"[!] Görselleştirme aşamasında hata: {e}")
+
     elapsed = round(time.time() - start_time, 2)
     print(f"\n[+] Tüm ETL boru hattı başarıyla tamamlandı. Geçen süre: {elapsed} saniye.")
 
-
 if __name__ == "__main__":
     run_pipeline()
-
-from src.utils import global_grafik_ciz
-
-# Pipeline bittikten sonra grafiği çizdir
-global_grafik_ciz()
