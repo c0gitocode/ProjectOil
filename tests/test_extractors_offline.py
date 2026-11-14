@@ -777,6 +777,80 @@ def test_dgcis_alert_first_delete_all_recovery(monkeypatch):
     assert drv.lists["sel_list4"] == ["A"]
 
 
+def test_dgcis_atomic_refresh_ignores_stale_and_loading_rows(monkeypatch):
+    import sys
+
+    class AtomicFakeDriver:
+        def __init__(self, snapshots):
+            self.snapshots = snapshots
+            self.idx = 0
+
+        def execute_script(self, script, *args):
+            cur = self.snapshots[min(self.idx, len(self.snapshots) - 1)]
+            self.idx += 1
+            return cur
+
+    class FakeWait:
+        def __init__(self, drv):
+            self.drv = drv
+
+        def until(self, cond):
+            for _ in range(30):
+                if cond(self.drv):
+                    return True
+            raise AssertionError("atomic condition never satisfied")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "selenium.common.exceptions",
+        SimpleNamespace(StaleElementReferenceException=RuntimeError, TimeoutException=TimeoutError),
+    )
+    monkeypatch.setitem(sys.modules, "selenium.webdriver.common.by", SimpleNamespace(By=SimpleNamespace(ID="id")))
+    monkeypatch.setitem(
+        sys.modules,
+        "selenium.webdriver.support.ui",
+        SimpleNamespace(WebDriverWait=lambda d, t: FakeWait(d)),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "selenium.webdriver.support.expected_conditions",
+        SimpleNamespace(staleness_of=lambda el: (lambda d: False)),
+    )
+
+    old_sig = "1|S5|CRUDE|RUSSIA|MUNDRA|TON|1000|1|1"
+    new_sig = "1|S5|CRUDE|RUSSIA|SIKKA|TON|2500|2|2"
+    new_row = ["1", "S5", "CRUDE", "RUSSIA", "SIKKA", "TON", "2500", "2", "2"]
+
+    # Senaryo 1: Önce eski ay satırları + pending HTTP, sonra geçici "Total 0" flash'ı, ardından gerçek yeni ay satırları (2 kararlı okuma)
+    drv1 = AtomicFakeDriver(
+        [
+            {"state": "rows", "rows": [["1", "S5", "CRUDE", "RUSSIA", "MUNDRA", "TON", "1000", "1", "1"]], "sig": old_sig, "pending": 1, "html": "old"},
+            {"state": "pending", "rows": [], "sig": "PENDING:Loading", "pending": 0, "html": "load"},
+            {"state": "empty", "rows": [], "sig": "EMPTY:total 0 records", "pending": 0, "html": "empty_flash"},
+            {"state": "rows", "rows": [new_row], "sig": new_sig, "pending": 0, "html": "new1"},
+            {"state": "rows", "rows": [new_row], "sig": new_sig, "pending": 0, "html": "new1"},
+        ]
+    )
+    extracted = []
+    has_rows = dgcis._wait_result_refresh(drv1, FakeWait(drv1), None, "old", old_sig=old_sig, out_rows=extracted)
+    assert has_rows is True
+    assert extracted == [new_row]
+
+    # Senaryo 2: Onaylı boş ay (geçiş + 3 kararlı boş kontrol) -> False ve boş satır listesi
+    drv2 = AtomicFakeDriver(
+        [
+            {"state": "pending", "rows": [], "sig": "PENDING:", "pending": 1, "html": "wait"},
+            {"state": "empty", "rows": [], "sig": "EMPTY:total 0 records", "pending": 0, "html": "z"},
+            {"state": "empty", "rows": [], "sig": "EMPTY:total 0 records", "pending": 0, "html": "z"},
+            {"state": "empty", "rows": [], "sig": "EMPTY:total 0 records", "pending": 0, "html": "z"},
+        ]
+    )
+    extracted2 = []
+    has_rows2 = dgcis._wait_result_refresh(drv2, FakeWait(drv2), None, "old", old_sig=old_sig, out_rows=extracted2)
+    assert has_rows2 is False
+    assert extracted2 == []
+
+
 def test_gacc_months_and_missing_years(tmp_path, monkeypatch):
     monkeypatch.setattr(gacc, "CHINA_RAW_DIR", tmp_path)
     monkeypatch.setattr(gacc, "START_DATE", "2024-01-01")

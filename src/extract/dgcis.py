@@ -256,13 +256,176 @@ def _ensure_filter_added(
         raise last_err
 
 
-def _wait_result_refresh(driver, wait, old_tbody, old_html: str) -> bool:
-    """Önceki ayın DOM tablosunun yenilenmesini bekler; veri satırı varsa True, boş sonuç onaylandıysa False döner."""
+_RESULT_SNAPSHOT_JS = """
+const res = document.getElementById('result');
+if (!res) return {state: 'missing', rows: [], sig: '', pending: 0, html: ''};
+const html = res.innerHTML || '';
+const txt = (res.innerText || res.textContent || '').replace(/\\s+/g, ' ').trim();
+const low = txt.toLowerCase();
+const hasTpl = html.includes('{{') || txt.includes('{{');
+
+let pending = 0;
+try {
+    if (window.angular) {
+        const el = window.angular.element(res).injector() ? window.angular.element(res) : window.angular.element(document.body);
+        const inj = el.injector && el.injector();
+        if (inj) pending += inj.get('$http').pendingRequests.length;
+    }
+} catch (e) {}
+try {
+    if (window.jQuery && typeof window.jQuery.active === 'number') {
+        pending += window.jQuery.active;
+    }
+} catch (e) {}
+
+const isVisible = (el) => {
+    let cur = el;
+    while (cur && cur.nodeType === 1) {
+        const st = window.getComputedStyle(cur);
+        if (st.display === 'none' || st.visibility === 'hidden') return false;
+        cur = cur.parentElement;
+    }
+    return true;
+};
+
+const trs = Array.from(res.querySelectorAll('table.table-bordered tbody tr'));
+const rows = [];
+for (const tr of trs) {
+    if (!isVisible(tr)) continue;
+    const tds = Array.from(tr.querySelectorAll('td'));
+    if (tds.length < 7) continue;
+    const cells = tds.map(td => (td.innerText || td.textContent || '').trim());
+    if (cells.some(c => c.includes('{{'))) continue;
+    if (!cells.some(c => c.length > 0)) continue;
+    rows.push(cells.slice(0, 9));
+}
+
+if (rows.length > 0) {
+    const sig = rows.map(r => r.join('|')).join('\\n');
+    return {state: 'rows', rows: rows, sig: sig, pending: pending, html: html};
+}
+const isZero = !hasTpl && (
+    /no\\s+data|no\\s+record|no\\s+matching|not\\s+found/.test(low) ||
+    /\\btotal\\s+0\\s+records\\b/.test(low)
+);
+if (isZero) {
+    return {state: 'empty', rows: [], sig: 'EMPTY:' + low, pending: pending, html: html};
+}
+return {state: 'pending', rows: [], sig: 'PENDING:' + txt.slice(0, 120), pending: pending, html: html};
+"""
+
+
+def _snapshot_result(driver) -> Optional[dict]:
+    if not hasattr(driver, "execute_script"):
+        return None
+    snap = driver.execute_script(_RESULT_SNAPSHOT_JS)
+    return snap if isinstance(snap, dict) else None
+
+
+def _wait_result_refresh(
+    driver,
+    wait,
+    old_tbody,
+    old_html: str,
+    old_sig: Optional[str] = None,
+    out_rows: Optional[List[List[str]]] = None,
+) -> bool:
+    """Önceki ayın DOM tablosunun yenilenmesini bekler; veri satırı varsa True (ve out_rows dolu), boş sonuç onaylandıysa False döner."""
+    import time
+
     from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.support.ui import WebDriverWait
 
+    # 1) Atomik JS destekli yol (gerçek tarayıcı + tam sahte sürücüler): TOCTOU yarışını ve başlık/loading <tr> tuzaklarını önler.
+    if hasattr(driver, "execute_script"):
+        tracker = {
+            "saw_transition": not bool(old_sig),
+            "started_at": time.monotonic(),
+            "has_rows": False,
+            "rows": [],
+            "stable_sig": None,
+            "stable_hits": 0,
+        }
+
+        def _is_old_stale(d) -> bool:
+            if old_tbody is None:
+                return False
+            try:
+                return bool(EC.staleness_of(old_tbody)(d))
+            except StaleElementReferenceException:
+                return True
+
+        def _ready_atomic(d) -> bool:
+            if _is_old_stale(d):
+                tracker["saw_transition"] = True
+
+            snap = _snapshot_result(d)
+            if snap is None:
+                return False
+
+            state = snap.get("state", "pending")
+            sig = str(snap.get("sig") or "")
+            pending = int(snap.get("pending") or 0)
+            elapsed = time.monotonic() - tracker["started_at"]
+
+            if pending > 0 or state in ("pending", "missing"):
+                tracker["saw_transition"] = True
+                tracker["stable_sig"] = None
+                tracker["stable_hits"] = 0
+                return False
+
+            if sig and old_sig and sig != old_sig:
+                tracker["saw_transition"] = True
+
+            if state == "rows":
+                # Önceki ayın satırları henüz ekrandan temizlenmemişse bekle (12 sn sonrası aynı veri tekrarı kabul edilir).
+                if not tracker["saw_transition"] and old_sig and sig == old_sig and elapsed < 12.0:
+                    tracker["stable_sig"] = None
+                    tracker["stable_hits"] = 0
+                    return False
+
+                if tracker["stable_sig"] == sig:
+                    tracker["stable_hits"] += 1
+                else:
+                    tracker["stable_sig"] = sig
+                    tracker["stable_hits"] = 1
+                if tracker["stable_hits"] < 2:
+                    return False
+
+                tracker["has_rows"] = True
+                tracker["rows"] = [list(r) for r in (snap.get("rows") or [])]
+                return True
+
+            if state == "empty":
+                # Ardışık iki ay da boşsa HTML değişmeyebilir; 2.5 sn bekleme + ardışık 2 kararlı kontrol ile geçici 0 flash'ını ele.
+                if not tracker["saw_transition"] and elapsed < 2.5:
+                    tracker["stable_sig"] = None
+                    tracker["stable_hits"] = 0
+                    return False
+
+                if tracker["stable_sig"] == sig:
+                    tracker["stable_hits"] += 1
+                else:
+                    tracker["stable_sig"] = sig
+                    tracker["stable_hits"] = 1
+                if tracker["stable_hits"] < 3:
+                    return False
+
+                tracker["has_rows"] = False
+                tracker["rows"] = []
+                return True
+
+            return False
+
+        wait.until(_ready_atomic)
+        if out_rows is not None:
+            out_rows.clear()
+            out_rows.extend(tracker["rows"])
+        return tracker["has_rows"]
+
+    # 2) execute_script olmayan sade mock sürücüler için geriye dönük yedek yol
     def _changed(d) -> bool:
         if old_tbody is not None:
             try:
@@ -279,7 +442,6 @@ def _wait_result_refresh(driver, wait, old_tbody, old_html: str) -> bool:
     try:
         WebDriverWait(driver, 15).until(_changed)
     except TimeoutException:
-        # Ardışık iki ay tamamen aynı "No data" metni üretirse içerik değişmeyebilir; alt kontrol devreye girer.
         pass
 
     state = {"has_rows": False}
@@ -304,6 +466,30 @@ def _wait_result_refresh(driver, wait, old_tbody, old_html: str) -> bool:
 
     wait.until(_ready)
     return state["has_rows"]
+
+
+def _set_period_field(driver, wait, field_id: str, period: str) -> None:
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support import expected_conditions as EC
+
+    el = wait.until(EC.element_to_be_clickable((By.ID, field_id)))
+    _scroll_center(driver, el)
+    el.clear()
+    el.send_keys(period)
+    if (el.get_attribute("value") or "").strip() != period:
+        driver.execute_script(
+            """
+            const f = arguments[0], val = arguments[1];
+            f.value = val;
+            f.dispatchEvent(new Event('input', {bubbles: true}));
+            f.dispatchEvent(new Event('change', {bubbles: true}));
+            if (window.angular) {
+                try { window.angular.element(f).triggerHandler('change'); } catch (e) {}
+            }
+            """,
+            el,
+            period,
+        )
 
 
 def update(headless: bool = True) -> None:
@@ -342,9 +528,7 @@ def update(headless: bool = True) -> None:
         driver.get(DGCIS_URL)
         wait = WebDriverWait(driver, 30)
         for field in ("datepicker1", "datepicker"):
-            el = wait.until(EC.element_to_be_clickable((By.ID, field)))
-            el.clear()
-            el.send_keys(todo[0])
+            _set_period_field(driver, wait, field, todo[0])
 
         click(wait.until(EC.element_to_be_clickable((By.ID, "eximp2"))))
         click(wait.until(EC.element_to_be_clickable((By.ID, "currency3"))))
@@ -360,28 +544,38 @@ def update(headless: bool = True) -> None:
 
         for period in todo:
             try:
-                result_el = driver.find_element(By.ID, "result")
-                old_html = result_el.get_attribute("innerHTML")
+                prev_snap = _snapshot_result(driver)
+                if prev_snap is not None:
+                    old_html = prev_snap.get("html", "")
+                    old_sig = prev_snap.get("sig", "")
+                else:
+                    old_html = driver.find_element(By.ID, "result").get_attribute("innerHTML")
+                    old_sig = ""
                 old_tbodies = driver.find_elements(
                     By.XPATH, "//div[@id='result']//table[contains(@class, 'table-bordered')]//tbody"
                 )
                 old_tbody = old_tbodies[0] if old_tbodies else None
 
                 for field in ("datepicker1", "datepicker"):
-                    el = wait.until(EC.element_to_be_clickable((By.ID, field)))
-                    _scroll_center(driver, el)
-                    el.clear()
-                    el.send_keys(period)
+                    _set_period_field(driver, wait, field, period)
                 click(wait.until(EC.element_to_be_clickable((By.ID, "select_all"))))
-                has_rows = _wait_result_refresh(driver, wait, old_tbody, old_html)
 
-                soup = BeautifulSoup(driver.find_element(By.ID, "result").get_attribute("outerHTML"), "html.parser")
-                rows = []
-                for tr in soup.select("tbody tr"):
-                    cols = [td.get_text(strip=True) for td in tr.find_all("td")]
-                    if len(cols) >= 7 and not any("{{" in c for c in cols):
-                        cols = (cols + ["", ""])[:9]
+                extracted_cells: List[List[str]] = []
+                has_rows = _wait_result_refresh(driver, wait, old_tbody, old_html, old_sig=old_sig, out_rows=extracted_cells)
+
+                rows: List[dict] = []
+                if has_rows and extracted_cells:
+                    for cells in extracted_cells:
+                        cols = (list(cells) + ["", ""])[:9]
                         rows.append(dict(zip(COLUMNS, [period] + cols)))
+                elif has_rows:
+                    soup = BeautifulSoup(driver.find_element(By.ID, "result").get_attribute("outerHTML"), "html.parser")
+                    for tr in soup.select("tbody tr"):
+                        cols = [td.get_text(strip=True) for td in tr.find_all("td")]
+                        if len(cols) >= 7 and not any("{{" in c for c in cols):
+                            cols = (cols + ["", ""])[:9]
+                            rows.append(dict(zip(COLUMNS, [period] + cols)))
+
                 if rows:
                     _append_rows(rows)
                 elif not has_rows:
@@ -402,6 +596,8 @@ def update(headless: bool = True) -> None:
                             }
                         ]
                     )
+                else:
+                    log.warning("DGCIS %s: tablo göründü ama geçerli satır okunamadı; eksik bırakıldı.", period)
                 log.info("DGCIS %s: %d kayıt", period, len(rows))
             except UnexpectedAlertPresentException as exc:
                 alert_txt = _consume_alert(driver) or getattr(exc, "alert_text", None) or str(exc)
