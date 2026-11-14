@@ -33,6 +33,42 @@ def _append_rows(rows: List[dict]) -> None:
     pd.DataFrame(rows, columns=COLUMNS).to_csv(path, mode="a", header=write_header, index=False)
 
 
+def _wait_select_value(driver, wait, sel_id: str, value: str) -> None:
+    from selenium.common.exceptions import StaleElementReferenceException
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import Select
+
+    def _ready(d) -> bool:
+        try:
+            opts = Select(d.find_element(By.ID, sel_id)).options
+            return any(o.get_attribute("value") == value and "{{" not in o.text for o in opts)
+        except StaleElementReferenceException:
+            return False
+
+    wait.until(_ready)
+    el = driver.find_element(By.ID, sel_id)
+    Select(el).select_by_value(value)
+    driver.execute_script("arguments[0].dispatchEvent(new Event('change', {bubbles: true}));", el)
+
+
+def _wait_select_index(driver, wait, sel_id: str, index: int = 1) -> None:
+    from selenium.common.exceptions import StaleElementReferenceException
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import Select
+
+    def _ready(d) -> bool:
+        try:
+            opts = Select(d.find_element(By.ID, sel_id)).options
+            return len(opts) > index and "{{" not in opts[index].text
+        except StaleElementReferenceException:
+            return False
+
+    wait.until(_ready)
+    el = driver.find_element(By.ID, sel_id)
+    Select(el).select_by_index(index)
+    driver.execute_script("arguments[0].dispatchEvent(new Event('change', {bubbles: true}));", el)
+
+
 def _wait_result_refresh(driver, wait, old_tbody, old_html: str) -> None:
     """Önceki ayın DOM tablosunun bayatlamasını (yenilenmesini) bekler."""
     from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
@@ -47,8 +83,11 @@ def _wait_result_refresh(driver, wait, old_tbody, old_html: str) -> None:
                     return True
             except StaleElementReferenceException:
                 return True
-        res = d.find_element(By.ID, "result")
-        return res.get_attribute("innerHTML") != old_html
+        try:
+            res = d.find_element(By.ID, "result")
+            return res.get_attribute("innerHTML") != old_html
+        except StaleElementReferenceException:
+            return True
 
     try:
         WebDriverWait(driver, 15).until(_changed)
@@ -57,11 +96,14 @@ def _wait_result_refresh(driver, wait, old_tbody, old_html: str) -> None:
         pass
 
     def _ready(d) -> bool:
-        res_el = d.find_element(By.ID, "result")
-        if d.find_elements(By.XPATH, "//div[@id='result']//table[contains(@class, 'table-bordered')]//tbody//tr"):
-            return True
-        txt = res_el.text.lower()
-        return "no data" in txt or "no record" in txt
+        try:
+            res_el = d.find_element(By.ID, "result")
+            if d.find_elements(By.XPATH, "//div[@id='result']//table[contains(@class, 'table-bordered')]//tbody//tr"):
+                return True
+            txt = res_el.text.lower()
+            return any(k in txt for k in ("no data", "no record", "no matching", "not found"))
+        except StaleElementReferenceException:
+            return False
 
     wait.until(_ready)
 
@@ -71,7 +113,7 @@ def update(headless: bool = True) -> None:
     from selenium.common.exceptions import TimeoutException
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support import expected_conditions as EC
-    from selenium.webdriver.support.ui import Select, WebDriverWait
+    from selenium.webdriver.support.ui import WebDriverWait
 
     log.info("DGCIS (Hindistan) veri çekme başlıyor...")
     path = FILES["dgcis"]
@@ -100,21 +142,21 @@ def update(headless: bool = True) -> None:
 
     try:
         driver.get(DGCIS_URL)
-        wait = WebDriverWait(driver, 25)
+        wait = WebDriverWait(driver, 30)
         wait.until(EC.element_to_be_clickable((By.ID, "datepicker1"))).send_keys(todo[0])
         wait.until(EC.element_to_be_clickable((By.ID, "datepicker"))).send_keys(todo[0])
 
-        click(driver.find_element(By.ID, "eximp2"))
-        click(driver.find_element(By.ID, "currency3"))
-        Select(driver.find_element(By.ID, "type")).select_by_value("10")
-        Select(driver.find_element(By.ID, "sorted")).select_by_index(1)
+        click(wait.until(EC.element_to_be_clickable((By.ID, "eximp2"))))
+        click(wait.until(EC.element_to_be_clickable((By.ID, "currency3"))))
+        _wait_select_value(driver, wait, "type", "10")
+        _wait_select_index(driver, wait, "sorted", 1)
         for sel_id, value, list_id in (
             ("comm", "S5", "sel_list"),
             ("con", "15344", "sel_list1"),
             ("port", "A", "sel_list4"),
         ):
-            Select(driver.find_element(By.ID, sel_id)).select_by_value(value)
-            click(driver.find_element(By.XPATH, f"//input[@onclick=\"adOption.addOption('{list_id}','{sel_id}');\"]"))
+            _wait_select_value(driver, wait, sel_id, value)
+            click(wait.until(EC.element_to_be_clickable((By.XPATH, f"//input[@onclick=\"adOption.addOption('{list_id}','{sel_id}');\"]"))))
 
         for period in todo:
             try:

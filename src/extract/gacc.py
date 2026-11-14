@@ -116,31 +116,51 @@ def _wait_new_download(before: Set[Path], timeout: int) -> Optional[Path]:
 # ---------------------------------------------------------
 # Selenium yardımcıları
 # ---------------------------------------------------------
+def _first_displayed(driver, xpath: str):
+    from selenium.common.exceptions import StaleElementReferenceException
+    from selenium.webdriver.common.by import By
+
+    for e in driver.find_elements(By.XPATH, xpath):
+        try:
+            if e.is_displayed():
+                return e
+        except StaleElementReferenceException:
+            continue
+    return None
+
+
 def _find_in_frames(driver, xpath: str):
     """Elemanı ana DOM'da, 1. ve 2. seviye iframe'lerde arar; bulunca o frame'de kalır."""
+    from selenium.common.exceptions import NoSuchFrameException, StaleElementReferenceException
     from selenium.webdriver.common.by import By
 
     driver.switch_to.default_content()
-    els = [e for e in driver.find_elements(By.XPATH, xpath) if e.is_displayed()]
-    if els:
-        return els[0]
+    el = _first_displayed(driver, xpath)
+    if el is not None:
+        return el
 
     for i in range(len(driver.find_elements(By.TAG_NAME, "iframe"))):
-        driver.switch_to.default_content()
-        frames = driver.find_elements(By.TAG_NAME, "iframe")
-        if i >= len(frames):
-            break
-        driver.switch_to.frame(frames[i])
-        els = [e for e in driver.find_elements(By.XPATH, xpath) if e.is_displayed()]
-        if els:
-            return els[0]
-        nested = driver.find_elements(By.TAG_NAME, "iframe")
-        for j in range(len(nested)):
-            driver.switch_to.frame(nested[j])
-            els = [e for e in driver.find_elements(By.XPATH, xpath) if e.is_displayed()]
-            if els:
-                return els[0]
-            driver.switch_to.parent_frame()
+        try:
+            driver.switch_to.default_content()
+            frames = driver.find_elements(By.TAG_NAME, "iframe")
+            if i >= len(frames):
+                break
+            driver.switch_to.frame(frames[i])
+            el = _first_displayed(driver, xpath)
+            if el is not None:
+                return el
+            nested = driver.find_elements(By.TAG_NAME, "iframe")
+            for j in range(len(nested)):
+                try:
+                    driver.switch_to.frame(nested[j])
+                    el = _first_displayed(driver, xpath)
+                    if el is not None:
+                        return el
+                except (NoSuchFrameException, StaleElementReferenceException):
+                    pass
+                driver.switch_to.parent_frame()
+        except (NoSuchFrameException, StaleElementReferenceException):
+            continue
 
     driver.switch_to.default_content()
     return None
@@ -299,7 +319,7 @@ def update(years: Optional[List[int]] = None) -> None:
             avail_m = max(1, now.month - 1) if year == now.year else 12
             end_month = min(end_cap_m, avail_m)
             log.info("GACC %d (1-%d) sorgulanıyor (%d/%d)", year, end_month, i + 1, len(todo))
-            _find_in_frames(driver, "//*[contains(text(),'Period')]")
+            _wait_for(driver, "//*[contains(text(),'Period')]", 20)
             if i > 0:
                 from selenium.webdriver.common.by import By
 

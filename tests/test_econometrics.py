@@ -83,3 +83,29 @@ def test_panel_fe_did_cluster_recovery():
     assert vol_row["did_katsayisi"] == pytest.approx(400.0, abs=10.0)
     assert vol_row["p_degeri"] < 0.001
     assert vol_row["n_ulke"] == 20
+
+
+def test_analyze_underdetermined_sample_safe():
+    import warnings
+
+    dates = pd.date_range("2018-01-01", periods=5, freq="MS")
+    y = pd.Series([40000.0, 40500.0, 41000.0, 40200.0, 40800.0], index=dates, name="GLOBAL_PETRODOLAR")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        summary, lines = econometrics.analyze(y, "Test 5 ay", break_date="2022-02-01")
+    assert not any("SingularMatrixWarning" in str(w.category) for w in caught)
+    assert np.isnan(summary.its_level_p)
+    assert np.isnan(summary.its_r2)
+    assert summary.n_post == 0
+    assert "p=nan" in "\n".join(lines)
+
+    # Tek treated kümede bölge-kümeli SE güvenilmez -> NaN bırakılmalı
+    p_dates = pd.date_range("2021-01-01", periods=24, freq="MS")
+    p_rows = []
+    for r in ("CN", "US", "TR", "JP"):
+        for d in p_dates:
+            post = int(d >= pd.Timestamp("2022-02-01"))
+            p_rows.append({"Date": d, "region": r, "petrodollar_kbd": 1000.0, "petroyuan_kbd": 500.0 * post if r == "CN" else 0.0})
+    single_res = econometrics.panel_fe_did(pd.DataFrame(p_rows), break_date="2022-02-01", treated_regions=("CN", "IN"))
+    assert np.isnan(single_res.loc[0, "se_kumelenmis"])
+    assert np.isnan(single_res.loc[0, "p_degeri"])
