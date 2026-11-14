@@ -843,10 +843,15 @@ def panel_event_study(
             pre_f = pre_p = float("nan")
         else:
             V_pre = cov_adj.loc[pre_cols, pre_cols].to_numpy(dtype=float)
+            V_sym = 0.5 * (V_pre + V_pre.T)
             b_pre = fwl.params.loc[pre_cols].to_numpy(dtype=float)
-            rank_v = int(np.linalg.matrix_rank(V_pre))
+            eigvals, eigvecs = np.linalg.eigh(V_sym)
+            max_ev = float(eigvals.max()) if eigvals.size else 0.0
+            pos = eigvals > max(1e-8, max_ev * 1e-3)
+            rank_v = int(pos.sum())
             if rank_v > 0:
-                wald = float(b_pre.T @ np.linalg.pinv(V_pre, rcond=1e-10) @ b_pre)
+                proj = eigvecs[:, pos].T @ b_pre
+                wald = float(np.sum((proj ** 2) / eigvals[pos]))
                 pre_f = wald / rank_v
                 pre_p = float(stats.f.sf(pre_f, rank_v, df_clust))
             else:
