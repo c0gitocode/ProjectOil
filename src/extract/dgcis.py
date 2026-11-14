@@ -1,4 +1,5 @@
 """DGCIS (Hindistan): Rusya'dan ham petrol ithalatı, liman bazlı aylık."""
+import re
 from typing import List, Optional
 
 import pandas as pd
@@ -33,10 +34,34 @@ def _append_rows(rows: List[dict]) -> None:
     pd.DataFrame(rows, columns=COLUMNS).to_csv(path, mode="a", header=write_header, index=False)
 
 
+def _scroll_center(driver, el) -> None:
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", el)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _trigger_angular_change(driver, el) -> None:
+    driver.execute_script(
+        """
+        const s = arguments[0];
+        s.dispatchEvent(new Event('change', {bubbles: true}));
+        if (window.angular) {
+            try { window.angular.element(s).triggerHandler('change'); } catch (e) {}
+        }
+        """,
+        el,
+    )
+
+
 def _wait_select_value(driver, wait, sel_id: str, value: str) -> None:
+    import sys
+
     from selenium.common.exceptions import StaleElementReferenceException
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import Select
+
+    intercept_exc = getattr(sys.modules["selenium.common.exceptions"], "ElementClickInterceptedException", RuntimeError)
 
     def _ready(d) -> bool:
         try:
@@ -47,14 +72,40 @@ def _wait_select_value(driver, wait, sel_id: str, value: str) -> None:
 
     wait.until(_ready)
     el = driver.find_element(By.ID, sel_id)
-    Select(el).select_by_value(value)
-    driver.execute_script("arguments[0].dispatchEvent(new Event('change', {bubbles: true}));", el)
+    _scroll_center(driver, el)
+    try:
+        Select(el).select_by_value(value)
+        _trigger_angular_change(driver, el)
+    except intercept_exc:
+        # Sayfa altındaki marquee bandı option.click()'i engellerse doğrudan JS + Angular ile seç.
+        driver.execute_script(
+            """
+            const s = arguments[0], val = arguments[1];
+            for (let i = 0; i < s.options.length; i++) {
+                if (s.options[i].value === val) {
+                    s.selectedIndex = i;
+                    s.options[i].selected = true;
+                    break;
+                }
+            }
+            s.dispatchEvent(new Event('change', {bubbles: true}));
+            if (window.angular) {
+                try { window.angular.element(s).triggerHandler('change'); } catch (e) {}
+            }
+            """,
+            el,
+            value,
+        )
 
 
 def _wait_select_index(driver, wait, sel_id: str, index: int = 1) -> None:
+    import sys
+
     from selenium.common.exceptions import StaleElementReferenceException
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import Select
+
+    intercept_exc = getattr(sys.modules["selenium.common.exceptions"], "ElementClickInterceptedException", RuntimeError)
 
     def _ready(d) -> bool:
         try:
@@ -65,12 +116,31 @@ def _wait_select_index(driver, wait, sel_id: str, index: int = 1) -> None:
 
     wait.until(_ready)
     el = driver.find_element(By.ID, sel_id)
-    Select(el).select_by_index(index)
-    driver.execute_script("arguments[0].dispatchEvent(new Event('change', {bubbles: true}));", el)
+    _scroll_center(driver, el)
+    try:
+        Select(el).select_by_index(index)
+        _trigger_angular_change(driver, el)
+    except intercept_exc:
+        # Sayfa altındaki marquee bandı option.click()'i engellerse doğrudan JS + Angular ile seç.
+        driver.execute_script(
+            """
+            const s = arguments[0], idx = arguments[1];
+            if (idx >= 0 && idx < s.options.length) {
+                s.selectedIndex = idx;
+                s.options[idx].selected = true;
+            }
+            s.dispatchEvent(new Event('change', {bubbles: true}));
+            if (window.angular) {
+                try { window.angular.element(s).triggerHandler('change'); } catch (e) {}
+            }
+            """,
+            el,
+            index,
+        )
 
 
-def _wait_result_refresh(driver, wait, old_tbody, old_html: str) -> None:
-    """Önceki ayın DOM tablosunun bayatlamasını (yenilenmesini) bekler."""
+def _wait_result_refresh(driver, wait, old_tbody, old_html: str) -> bool:
+    """Önceki ayın DOM tablosunun yenilenmesini bekler; veri satırı varsa True, boş sonuç onaylandıysa False döner."""
     from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support import expected_conditions as EC
@@ -95,17 +165,28 @@ def _wait_result_refresh(driver, wait, old_tbody, old_html: str) -> None:
         # Ardışık iki ay tamamen aynı "No data" metni üretirse içerik değişmeyebilir; alt kontrol devreye girer.
         pass
 
+    state = {"has_rows": False}
+
     def _ready(d) -> bool:
         try:
             res_el = d.find_element(By.ID, "result")
-            if d.find_elements(By.XPATH, "//div[@id='result']//table[contains(@class, 'table-bordered')]//tbody//tr"):
+            rows = d.find_elements(By.XPATH, "//div[@id='result']//table[contains(@class, 'table-bordered')]//tbody//tr")
+            if any(r.is_displayed() and r.text.strip() and "{{" not in r.text for r in rows):
+                state["has_rows"] = True
                 return True
             txt = res_el.text.lower()
-            return any(k in txt for k in ("no data", "no record", "no matching", "not found"))
+            if "{{" not in txt and (
+                any(k in txt for k in ("no data", "no record", "no matching", "not found"))
+                or re.search(r"\btotal\s+0\s+records\b", txt) is not None
+            ):
+                state["has_rows"] = False
+                return True
+            return False
         except StaleElementReferenceException:
             return False
 
     wait.until(_ready)
+    return state["has_rows"]
 
 
 def update(headless: bool = True) -> None:
@@ -169,20 +250,39 @@ def update(headless: bool = True) -> None:
 
                 for field in ("datepicker1", "datepicker"):
                     el = wait.until(EC.element_to_be_clickable((By.ID, field)))
+                    _scroll_center(driver, el)
                     el.clear()
                     el.send_keys(period)
                 click(wait.until(EC.element_to_be_clickable((By.ID, "select_all"))))
-                _wait_result_refresh(driver, wait, old_tbody, old_html)
+                has_rows = _wait_result_refresh(driver, wait, old_tbody, old_html)
 
                 soup = BeautifulSoup(driver.find_element(By.ID, "result").get_attribute("outerHTML"), "html.parser")
                 rows = []
                 for tr in soup.select("tbody tr"):
                     cols = [td.get_text(strip=True) for td in tr.find_all("td")]
-                    if len(cols) >= 7:
+                    if len(cols) >= 7 and not any("{{" in c for c in cols):
                         cols = (cols + ["", ""])[:9]
                         rows.append(dict(zip(COLUMNS, [period] + cols)))
                 if rows:
                     _append_rows(rows)
+                elif not has_rows:
+                    # Onaylı "0 kayıt / veri yok" ayı: 0 ton yazılır ki transform eksik sanıp ayı düşürmesin.
+                    _append_rows(
+                        [
+                            {
+                                "Period": period,
+                                "No": "0",
+                                "PC_Code": "S5",
+                                "Commodity": "NO DATA / ZERO",
+                                "Country": "RUSSIA",
+                                "Port": "ALL",
+                                "Unit": "TON",
+                                "Qty": "0",
+                                "Value_INR": "0",
+                                "Value_USD": "0",
+                            }
+                        ]
+                    )
                 log.info("DGCIS %s: %d kayıt", period, len(rows))
             except TimeoutException:
                 log.warning("DGCIS %s zaman aşımı, atlandı.", period)
