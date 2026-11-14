@@ -1,39 +1,41 @@
-import os
+"""Load katmanı: işlenmiş CSV'leri SQLite'a yükler."""
 import sqlite3
+from datetime import datetime
+
 import pandas as pd
-from config import PROCESSED_DIR
+
+from .config import DB_PATH, FILES
+from .logger import get_logger
+
+log = get_logger(__name__)
+
+# tablo adı -> (dosya anahtarı, tarih index'li mi)
+TABLES = {
+    "global_petrodollar_petroyuan": ("global", True),
+    "panel_long": ("panel", False),
+    "china_payment": ("china_payment", True),
+    "china_imports": ("china_imports", False),
+    "india_analysis": ("india", True),
+    "tr_epdk": ("epdk", False),
+    "tr_master_analysis": ("tr_master", False),
+    "jodi_crude_imports": ("jodi", True),
+    "us_crude_imports": ("eia", True),
+}
 
 
-def load_data_to_sqlite() -> None:
-    db_path = os.path.join(PROCESSED_DIR, "oil_database.db")
-    print("[*] Load katmanı: Veriler SQLite veritabanına yükleniyor...")
-
-    conn = sqlite3.connect(db_path)
-
-    files_to_load = {
-        "master_analysis": "MASTER_ANALYSIS.csv",
-        "china_imports": "china_oil_imports_processed.csv",
-        "india_analysis": "hindistan_nihai_hacim_analizi_kbd.csv",
-        "tr_epdk": "tr_epdk_master.csv",
-        "jodi_europe_asia": "jodi_avrupa_asya_petrodolar.csv",
-        "us_petrodollar": "saf_abd_petrodolar.csv"
-    }
-
-    loaded_count = 0
-    for table_name, file_name in files_to_load.items():
-        file_path = os.path.join(PROCESSED_DIR, file_name)
-        if os.path.exists(file_path):
-            try:
-                df = pd.read_csv(file_path)
-                df.to_sql(table_name, conn, if_exists='replace', index=False)
-                print(f"[+] Tablo güncellendi: {table_name} ({len(df)} satır)")
-                loaded_count += 1
-            except Exception as e:
-                print(f"[!] Hata ({table_name}): {e}")
-
-    conn.close()
-    print(f"[+] Load katmanı tamamlandı. Toplam {loaded_count} tablo işlendi: {db_path}")
-
-
-if __name__ == "__main__":
-    load_data_to_sqlite()
+def load_data_to_sqlite() -> bool:
+    log.info("SQLite yükleme: %s", DB_PATH)
+    loaded = []
+    with sqlite3.connect(DB_PATH) as conn:
+        for table, (key, indexed) in TABLES.items():
+            path = FILES[key]
+            if not path.exists():
+                continue
+            df = pd.read_csv(path, index_col=0 if indexed else None, parse_dates=indexed or False)
+            df.to_sql(table, conn, if_exists="replace", index=indexed)
+            loaded.append((table, len(df)))
+        pd.DataFrame([{"table": t, "rows": n, "loaded_at": datetime.now().isoformat(timespec="seconds")}
+                      for t, n in loaded]).to_sql("_metadata", conn, if_exists="replace", index=False)
+    for t, n in loaded:
+        log.info("  %-32s %6d satır", t, n)
+    return bool(loaded)
