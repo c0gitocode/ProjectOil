@@ -41,19 +41,6 @@ def _scroll_center(driver, el) -> None:
         pass
 
 
-def _trigger_angular_change(driver, el) -> None:
-    driver.execute_script(
-        """
-        const s = arguments[0];
-        s.dispatchEvent(new Event('change', {bubbles: true}));
-        if (window.angular) {
-            try { window.angular.element(s).triggerHandler('change'); } catch (e) {}
-        }
-        """,
-        el,
-    )
-
-
 def _wait_select_value(driver, wait, sel_id: str, value: str) -> None:
     import sys
 
@@ -75,7 +62,6 @@ def _wait_select_value(driver, wait, sel_id: str, value: str) -> None:
     _scroll_center(driver, el)
     try:
         Select(el).select_by_value(value)
-        _trigger_angular_change(driver, el)
     except intercept_exc:
         # Sayfa altındaki marquee bandı option.click()'i engellerse doğrudan JS + Angular ile seç.
         driver.execute_script(
@@ -119,7 +105,6 @@ def _wait_select_index(driver, wait, sel_id: str, index: int = 1) -> None:
     _scroll_center(driver, el)
     try:
         Select(el).select_by_index(index)
-        _trigger_angular_change(driver, el)
     except intercept_exc:
         # Sayfa altındaki marquee bandı option.click()'i engellerse doğrudan JS + Angular ile seç.
         driver.execute_script(
@@ -137,6 +122,138 @@ def _wait_select_index(driver, wait, sel_id: str, index: int = 1) -> None:
             el,
             index,
         )
+
+
+def _consume_alert(driver) -> Optional[str]:
+    """Açık JS uyarısı (alert) varsa metnini alır ve kabul ederek kapatır."""
+    import sys
+
+    no_alert_exc = getattr(sys.modules["selenium.common.exceptions"], "NoAlertPresentException", Exception)
+    try:
+        alert = driver.switch_to.alert
+        txt = (getattr(alert, "text", None) or "").strip()
+        alert.accept()
+        return txt
+    except no_alert_exc:
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _read_filter_options(driver, list_id: str) -> Optional[List[str]]:
+    vals = driver.execute_script(
+        "const l = document.getElementById(arguments[0]); return l ? Array.from(l.options).map(o => o.value) : null;",
+        list_id,
+    )
+    if vals is None:
+        return None
+    return [str(v) for v in vals]
+
+
+def _clear_filter_list(driver, click, list_id: str) -> None:
+    """Hedef çoklu seçim kutusundaki mevcut ('ALL' vb.) öğeleri temizler."""
+    from selenium.webdriver.common.by import By
+
+    driver.execute_script(
+        """
+        const l = document.getElementById(arguments[0]);
+        if (!l) return;
+        for (let i = 0; i < l.options.length; i++) { l.options[i].selected = true; }
+        l.dispatchEvent(new Event('change', {bubbles: true}));
+        """,
+        list_id,
+    )
+    del_btns = driver.find_elements(
+        By.XPATH,
+        f"//*[@onclick and contains(@onclick, 'adOption') and contains(@onclick, \"'{list_id}'\") and not(contains(@onclick, 'addOption'))]",
+    )
+    for btn in del_btns:
+        try:
+            click(btn)
+            _consume_alert(driver)
+        except Exception:  # noqa: BLE001
+            _consume_alert(driver)
+
+    driver.execute_script(
+        """
+        const l = document.getElementById(arguments[0]);
+        if (l && l.options.length > 0) {
+            l.options.length = 0;
+            l.dispatchEvent(new Event('change', {bubbles: true}));
+            if (window.angular) {
+                try { window.angular.element(l).triggerHandler('change'); } catch (e) {}
+            }
+        }
+        """,
+        list_id,
+    )
+
+
+def _ensure_filter_added(
+    driver,
+    wait,
+    click,
+    sel_id: str,
+    value: str,
+    list_id: str,
+    attempts: int = 3,
+) -> None:
+    """Seçim kutusunu hedef listeye ekler; önceden dolu 'ALL' / alert hatalarını temizleyip tekrarlar."""
+    import sys
+
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support import expected_conditions as EC
+
+    alert_exc = getattr(sys.modules["selenium.common.exceptions"], "UnexpectedAlertPresentException", RuntimeError)
+    add_xpath = f"//input[@onclick=\"adOption.addOption('{list_id}','{sel_id}');\"]"
+    last_err: Optional[Exception] = None
+
+    for attempt in range(1, attempts + 1):
+        _consume_alert(driver)
+        try:
+            existing = _read_filter_options(driver, list_id)
+            if existing == [value]:
+                return
+            if existing:
+                log.info("DGCIS %s içinde önceki değerler temizleniyor: %s", list_id, existing)
+                _clear_filter_list(driver, click, list_id)
+
+            _wait_select_value(driver, wait, sel_id, value)
+            click(wait.until(EC.element_to_be_clickable((By.XPATH, add_xpath))))
+
+            after = _read_filter_options(driver, list_id)
+            if after is None or value in after:
+                return
+            log.warning("DGCIS %s=%s eklendikten sonra %s boş/farklı (%s); yeniden deneniyor.", sel_id, value, list_id, after)
+            _clear_filter_list(driver, click, list_id)
+        except alert_exc as exc:
+            last_err = exc
+            alert_txt = _consume_alert(driver) or getattr(exc, "alert_text", None) or str(exc)
+            cur = None
+            try:
+                cur = _read_filter_options(driver, list_id)
+            except Exception:  # noqa: BLE001
+                pass
+            if cur == [value]:
+                log.info("DGCIS %s (%s=%s) uyarısı kapatıldı, değer listede mevcut: %s", list_id, sel_id, value, alert_txt)
+                return
+            log.warning(
+                "DGCIS %s=%s -> %s uyarısı yakalandı (deneme %d/%d, mevcut=%s): %s",
+                sel_id,
+                value,
+                list_id,
+                attempt,
+                attempts,
+                cur,
+                alert_txt,
+            )
+            try:
+                _clear_filter_list(driver, click, list_id)
+            except Exception:  # noqa: BLE001
+                _consume_alert(driver)
+
+    if last_err is not None:
+        raise last_err
 
 
 def _wait_result_refresh(driver, wait, old_tbody, old_html: str) -> bool:
@@ -191,7 +308,7 @@ def _wait_result_refresh(driver, wait, old_tbody, old_html: str) -> bool:
 
 def update(headless: bool = True) -> None:
     from selenium import webdriver
-    from selenium.common.exceptions import TimeoutException
+    from selenium.common.exceptions import TimeoutException, UnexpectedAlertPresentException
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.support.ui import WebDriverWait
@@ -224,8 +341,10 @@ def update(headless: bool = True) -> None:
     try:
         driver.get(DGCIS_URL)
         wait = WebDriverWait(driver, 30)
-        wait.until(EC.element_to_be_clickable((By.ID, "datepicker1"))).send_keys(todo[0])
-        wait.until(EC.element_to_be_clickable((By.ID, "datepicker"))).send_keys(todo[0])
+        for field in ("datepicker1", "datepicker"):
+            el = wait.until(EC.element_to_be_clickable((By.ID, field)))
+            el.clear()
+            el.send_keys(todo[0])
 
         click(wait.until(EC.element_to_be_clickable((By.ID, "eximp2"))))
         click(wait.until(EC.element_to_be_clickable((By.ID, "currency3"))))
@@ -236,8 +355,8 @@ def update(headless: bool = True) -> None:
             ("con", "15344", "sel_list1"),
             ("port", "A", "sel_list4"),
         ):
-            _wait_select_value(driver, wait, sel_id, value)
-            click(wait.until(EC.element_to_be_clickable((By.XPATH, f"//input[@onclick=\"adOption.addOption('{list_id}','{sel_id}');\"]"))))
+            _ensure_filter_added(driver, wait, click, sel_id, value, list_id)
+        _consume_alert(driver)
 
         for period in todo:
             try:
@@ -284,6 +403,9 @@ def update(headless: bool = True) -> None:
                         ]
                     )
                 log.info("DGCIS %s: %d kayıt", period, len(rows))
+            except UnexpectedAlertPresentException as exc:
+                alert_txt = _consume_alert(driver) or getattr(exc, "alert_text", None) or str(exc)
+                log.warning("DGCIS %s uyarısı nedeniyle atlandı: %s", period, alert_txt)
             except TimeoutException:
                 log.warning("DGCIS %s zaman aşımı, atlandı.", period)
     finally:

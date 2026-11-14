@@ -270,6 +270,166 @@ def test_epdk_real_2025_titles_and_candidate_fallback(tmp_path, monkeypatch):
     assert res["TR_Toplam_Ithalat_Ton"] == pytest.approx(1_000_000.0)
 
 
+def _make_minimal_docx_bytes() -> bytes:
+    import zipfile
+
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        "</Types>"
+    )
+    doc_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<w:body><w:tbl>"
+        # Row 0: 'Ülke' (vMerge=restart) + 'İthalat (Ton)' (gridSpan=2)
+        "<w:tr>"
+        '<w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>Ülke</w:t></w:r></w:p></w:tc>'
+        '<w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>İthalat (Ton)</w:t></w:r></w:p></w:tc>'
+        "</w:tr>"
+        # Row 1: vMerge continue -> 'Ülke' miras alınmalı, 'Ham Petrol', 'Motorin'
+        "<w:tr>"
+        '<w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc>'
+        "<w:tc><w:p><w:r><w:t>Ham </w:t></w:r><w:r><w:t>Petrol</w:t></w:r></w:p></w:tc>"
+        "<w:tc><w:p><w:r><w:t>Motorin</w:t></w:r></w:p></w:tc>"
+        "</w:tr>"
+        "<w:tr>"
+        "<w:tc><w:p><w:r><w:t>Rusya Federasyonu</w:t></w:r></w:p></w:tc>"
+        "<w:tc><w:p><w:r><w:t>1.250.000,5</w:t></w:r></w:p></w:tc>"
+        "<w:tc><w:p><w:r><w:t>100</w:t></w:r></w:p></w:tc>"
+        "</w:tr>"
+        "<w:tr>"
+        "<w:tc><w:p><w:r><w:t>Genel Toplam</w:t></w:r></w:p></w:tc>"
+        "<w:tc><w:p><w:r><w:t>2.500.000</w:t></w:r></w:p></w:tc>"
+        "<w:tc><w:p><w:r><w:t>200</w:t></w:r></w:p></w:tc>"
+        "</w:tr>"
+        "</w:tbl></w:body></w:document>"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("word/document.xml", doc_xml)
+    # _process_report <1024 byte koruması için ZIP yorumu veya ek dolgu dosyası ekle
+    buf2 = io.BytesIO()
+    with zipfile.ZipFile(buf2, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("word/document.xml", doc_xml)
+        zf.writestr("word/styles.xml", "<w:styles/>" + " " * 1200)
+    return buf2.getvalue()
+
+
+def test_epdk_docx_xlsx_zip_and_word_links(tmp_path, monkeypatch):
+    import openpyxl
+    import sys
+    import zipfile
+
+    docx_bytes = _make_minimal_docx_bytes()
+    assert epdk._detect_doc_type(docx_bytes) == "docx"
+    assert epdk._detect_doc_type(b"%PDF-1.7\n...") == "pdf"
+    assert epdk._detect_doc_type(b"<html>Error</html>") == "html"
+    assert epdk._detect_doc_type(epdk._OLE2_MAGIC + b"W\x00o\x00r\x00d\x00D\x00o\x00c\x00u\x00m\x00e\x00n\x00t") == "doc"
+
+    # stdlib XML fallback (python-docx olmadan da çalışmalı)
+    docx_file = tmp_path / "sample.docx"
+    docx_file.write_bytes(docx_bytes)
+    monkeypatch.setitem(sys.modules, "docx", None)
+    parsed = epdk.parse_docx(docx_file)
+    assert parsed is not None
+    assert parsed[0] == pytest.approx(2_500_000.0)
+    assert parsed[1] == pytest.approx(1_250_000.5)
+
+    # python-docx kütüphane yolu da doğru çalışmalı
+    FakeCell = lambda t: SimpleNamespace(text=t, tables=[])  # noqa: E731
+    FakeRow = lambda vals: SimpleNamespace(cells=[FakeCell(v) for v in vals])  # noqa: E731
+    FakeTable = SimpleNamespace(
+        rows=[
+            FakeRow(["Ülke", "Ham Petrol", "Motorin"]),
+            FakeRow(["Rusya", "600.000", "10"]),
+            FakeRow(["Toplam", "1.500.000", "50"]),
+        ]
+    )
+    monkeypatch.setitem(sys.modules, "docx", SimpleNamespace(Document=lambda p: SimpleNamespace(tables=[FakeTable])))
+    assert epdk.parse_docx(docx_file) == pytest.approx((1_500_000.0, 600_000.0))
+    monkeypatch.setitem(sys.modules, "docx", None)
+
+    # XLSX doğrulaması + parse_xlsx
+    xlsx_file = tmp_path / "sample.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["Ülke", "Ham Petrol (Ton)"])
+    ws.append(["Rusya", 300000])
+    ws.append(["Toplam", 900000])
+    wb.save(xlsx_file)
+    assert epdk._detect_doc_type(xlsx_file.read_bytes()) == "xlsx"
+    assert epdk.parse_xlsx(xlsx_file) == pytest.approx((900_000.0, 300_000.0))
+
+    # Word ikonu / .docx linki elenmemeli, PDF öncelikli kalmalı, Excel atlanmalı
+    html = """
+    <div>
+      <p>2020 Yılı Kasım Ayı Petrol Piyasası Sektör Raporu
+        <a href="/Detay/DownloadDocument?id=word_nov"><img src="/img/word.png" alt="Word"/>Rapor (.docx)</a>
+        <a href="/Detay/DownloadDocument?id=xls_nov"><img src="/img/xls.png" alt="Excel"/>Tablo</a>
+      </p>
+      <p>2021 Yılı Mart Ayı Petrol Piyasası Sektör Raporu
+        <a href="/files/2021_mart.docx">Rapor İndir</a>
+      </p>
+    </div>
+    """
+    links = epdk.find_report_links(html, 2018)
+    assert links == {
+        (2020, 11): "https://www.epdk.gov.tr/Detay/DownloadDocument?id=word_nov",
+        (2021, 3): "https://www.epdk.gov.tr/files/2021_mart.docx",
+    }
+
+    # ZIP içindeki DOCX yanıtı + cookie/Referer aktarımı + cache okuma doğrulaması
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w") as zf:
+        zf.writestr("rapor_2025_02.docx", docx_bytes)
+    zip_bytes = zip_buf.getvalue()
+
+    monkeypatch.setattr(epdk, "RAW_DIR", tmp_path)
+    seen_sessions = []
+
+    class FakeResp:
+        def __init__(self, content):
+            self.content = content
+            self.status_code = 200
+            self.headers = {"Content-Type": "application/zip", "Content-Disposition": 'attachment; filename="rapor.zip"'}
+
+        def raise_for_status(self):
+            return None
+
+    class FakeCurlSession:
+        def __init__(self, **kwargs):
+            self.headers = {}
+            self.cookies = {}
+            seen_sessions.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def get(self, url, timeout=60):
+            return FakeResp(zip_bytes)
+
+    monkeypatch.setitem(sys.modules, "curl_cffi", SimpleNamespace(requests=SimpleNamespace(Session=FakeCurlSession)))
+    row = epdk._process_report(2025, 2, "https://example.com/doc202502", cookies={"ASP.NET_SessionId": "abc"})
+    assert row is not None
+    assert row["TR_Toplam_Ithalat_Ton"] == pytest.approx(2_500_000.0)
+    assert row["TR_Rusya_Ithalat_Ton"] == pytest.approx(1_250_000.5)
+    assert seen_sessions[-1].headers.get("Referer") == epdk.EPDK_PAGE
+    assert seen_sessions[-1].cookies.get("ASP.NET_SessionId") == "abc"
+    assert (tmp_path / "epdk" / "2025" / "epdk_2025_02.docx").exists()
+
+    # Önbellekte geçerli DOCX varken ağa gitmeden doğrudan okunmalı
+    monkeypatch.setitem(sys.modules, "curl_cffi", SimpleNamespace(requests=SimpleNamespace(Session=lambda **kw: (_ for _ in ()).throw(AssertionError("ağ çağrılmamalı")))))
+    cached_row = epdk._process_report(2025, 2, "https://example.com/doc202502")
+    assert cached_row["TR_Toplam_Ithalat_Ton"] == pytest.approx(2_500_000.0)
+
+
 # ---------------------------------------------------------
 # DGCIS ve GACC testleri
 # ---------------------------------------------------------
@@ -478,6 +638,143 @@ def test_dgcis_marquee_intercept_and_refresh(monkeypatch):
         [{"res_text": "Total 1 Records", "html": "changed", "rows": [FakeNode("1 S5 CRUDE RUSSIA 1000")]}]
     )
     assert dgcis._wait_result_refresh(rdrv_ok, FakeWait(rdrv_ok), None, "init") is True
+
+
+def test_dgcis_alert_first_delete_all_recovery(monkeypatch):
+    import sys
+
+    class FakeNoAlertError(Exception):
+        pass
+
+    class FakeUnexpectedAlertError(Exception):
+        def __init__(self, msg="", alert_text=None):
+            super().__init__(msg)
+            self.alert_text = alert_text
+
+    class FakeOpt:
+        def __init__(self, value, text):
+            self._v = value
+            self.text = text
+
+        def get_attribute(self, name):
+            return self._v if name == "value" else None
+
+    class FakeSelectEl:
+        def __init__(self, opts):
+            self._opts = opts
+            self.selected = None
+
+        def current_options(self):
+            return self._opts
+
+    class FakeSelect:
+        def __init__(self, el):
+            self.el = el
+            self.options = el.current_options()
+
+        def select_by_value(self, val):
+            self.el.selected = val
+
+    class FakeAlert:
+        def __init__(self, parent, text):
+            self.parent = parent
+            self.text = text
+
+        def accept(self):
+            self.parent.accepted_alerts.append(self.text)
+            self.parent.open_alert = None
+
+    class FakeSwitchTo:
+        def __init__(self, parent):
+            self.parent = parent
+
+        @property
+        def alert(self):
+            if self.parent.open_alert is None:
+                raise FakeNoAlertError("no alert")
+            return FakeAlert(self.parent, self.parent.open_alert)
+
+    class AlertDriver:
+        def __init__(self):
+            # sel_list1 başlangıçta "ALL" dolu olsun; ilk add'te açık uyarı üretsin, temizlendikten sonra başarılsın
+            self.lists = {"sel_list1": ["ALL"], "sel_list4": ["ALL"]}
+            self.selects = {
+                "con": FakeSelectEl([FakeOpt("", "SELECT"), FakeOpt("15344", "RUSSIA")]),
+                "port": FakeSelectEl([FakeOpt("", "SELECT"), FakeOpt("A", "ALL")]),
+            }
+            self.open_alert = None
+            self.accepted_alerts = []
+            self.switch_to = FakeSwitchTo(self)
+            self.add_calls = 0
+
+        def find_element(self, by, loc):
+            if self.open_alert:
+                raise FakeUnexpectedAlertError(self.open_alert, alert_text=self.open_alert)
+            if by == "id":
+                return self.selects[loc]
+            return ("btn", loc)
+
+        def find_elements(self, by, loc):
+            if "not(contains(@onclick, 'addOption'))" in loc:
+                return [("del", "sel_list1")] if "sel_list1" in loc else [("del", "sel_list4")]
+            return []
+
+        def execute_script(self, script, *args):
+            if self.open_alert:
+                raise FakeUnexpectedAlertError(self.open_alert, alert_text=self.open_alert)
+            if "Array.from(l.options)" in script:
+                return list(self.lists.get(args[0], []))
+            if "l.options.length = 0" in script:
+                self.lists[args[0]] = []
+            return None
+
+        def fake_click(self, el):
+            if isinstance(el, tuple) and el[0] == "del":
+                self.lists[el[1]] = []
+            elif isinstance(el, tuple) and "sel_list1" in el[1]:
+                self.add_calls += 1
+                if self.add_calls == 1:
+                    # İlk denemede DGCIS "FIRST DELETE ALL VALUE " fırlatsın
+                    self.open_alert = "FIRST DELETE ALL VALUE "
+                else:
+                    self.lists["sel_list1"] = ["15344"]
+            elif isinstance(el, tuple) and "sel_list4" in el[1]:
+                self.lists["sel_list4"] = ["A"]
+
+    class FakeWait:
+        def __init__(self, drv):
+            self.drv = drv
+
+        def until(self, cond):
+            return cond(self.drv)
+
+    monkeypatch.setitem(sys.modules, "selenium.webdriver.common.by", SimpleNamespace(By=SimpleNamespace(ID="id", XPATH="xpath")))
+    monkeypatch.setitem(
+        sys.modules,
+        "selenium.common.exceptions",
+        SimpleNamespace(
+            StaleElementReferenceException=RuntimeError,
+            ElementClickInterceptedException=RuntimeError,
+            NoAlertPresentException=FakeNoAlertError,
+            UnexpectedAlertPresentException=FakeUnexpectedAlertError,
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "selenium.webdriver.support.ui", SimpleNamespace(Select=FakeSelect))
+    monkeypatch.setitem(
+        sys.modules,
+        "selenium.webdriver.support.expected_conditions",
+        SimpleNamespace(element_to_be_clickable=lambda loc: (lambda d: d.find_element(*loc))),
+    )
+
+    drv = AlertDriver()
+    wait = FakeWait(drv)
+    dgcis._ensure_filter_added(drv, wait, drv.fake_click, "con", "15344", "sel_list1")
+    assert drv.lists["sel_list1"] == ["15344"]
+    assert drv.accepted_alerts == ["FIRST DELETE ALL VALUE "]
+
+    # sel_list4 "A" zaten seçili değil; "ALL" temizlenip "A" eklenmeli
+    dgcis._ensure_filter_added(drv, wait, drv.fake_click, "port", "A", "sel_list4")
+    assert drv.lists["sel_list4"] == ["A"]
 
 
 def test_gacc_months_and_missing_years(tmp_path, monkeypatch):
