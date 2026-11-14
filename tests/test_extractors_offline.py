@@ -210,6 +210,66 @@ def test_epdk_find_report_links_html_variants():
     }
 
 
+def test_epdk_real_2025_titles_and_candidate_fallback(tmp_path, monkeypatch):
+    import sys
+
+    # Gerçek EPDK çıktısında görülen başlık biçimleri (jenerik img ikonu ve "pdf" kelimesi olmadan)
+    html = """
+    <div>
+      <p><a href="/Detay/DownloadDocument?id=jKekVOLPSRk="><img src="/img/file.png"/>2025 Yılı Petrol Piyasası Ocak Ayı Sektör Raporu</a></p>
+      <p><a href="/Detay/DownloadDocument?id=ayK0wM7uGi0="><img src="/img/file.png"/>2025 Yılı Petrol Piyasası Şubat Ayı Sektör Raporu2</a></p>
+      <p><a href="/Detay/DownloadDocument?id=9MUrmuaYSXY="><img src="/img/file.png"/>2025_Petrol Piyasası Mart Ayı Sektör Raporu</a></p>
+      <p><a href="/Detay/DownloadDocument?id=OrqvVTwVfqI="><img src="/img/file.png"/>2025 Yılı Petrol Piyasası Nisan_Ayı Sektör Raporu_Rev</a></p>
+      <p><a href="/Detay/DownloadDocument?id=YVOtDmShkzg="><img src="/img/file.png"/>2025 Yılı_Petrol Piyasası Mayıs Ayı Sektör Raporu</a></p>
+      <p>
+        2025 Yılı Haziran Ayı Petrol Piyasası Sektör Raporu
+        <a href="/Detay/DownloadDocument?id=haz_ek"><img src="/img/generic.png"/>Ek Tablo</a>
+        <a href="/Detay/DownloadDocument?id=haz_pdf"><img src="/img/pdf.png"/>Rapor</a>
+      </p>
+    </div>
+    """
+    links, stats = epdk._collect_report_links(html, 2020)
+    assert set(links.keys()) == {(2025, 1), (2025, 2), (2025, 3), (2025, 4), (2025, 5), (2025, 6)}
+    # Haziran için açık PDF etiketi olan aday öncelikli seçilmeli
+    assert links[(2025, 6)] == "https://www.epdk.gov.tr/Detay/DownloadDocument?id=haz_pdf"
+    assert stats["candidates_by_ym"][(2025, 6)] == [
+        "https://www.epdk.gov.tr/Detay/DownloadDocument?id=haz_pdf",
+        "https://www.epdk.gov.tr/Detay/DownloadDocument?id=haz_ek",
+    ]
+
+    # Çoklu aday fallback: ilk URL xlsx (PK...), ikinci URL geçerli %PDF ise ikinciye düşüp başarmalı
+    monkeypatch.setattr(epdk, "RAW_DIR", tmp_path)
+    monkeypatch.setattr(epdk, "parse_pdf", lambda p: (1_000_000.0, 400_000.0))
+
+    class FakeResp:
+        def __init__(self, content):
+            self.content = content
+
+        def raise_for_status(self):
+            return None
+
+    class FakeCurlSession:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def get(self, url, timeout=60):
+            if "ek" in url:
+                return FakeResp(b"PK\x03\x04" + b"\x00" * 2048)
+            return FakeResp(b"%PDF-1.4\n" + b"0" * 2048)
+
+    monkeypatch.setitem(sys.modules, "curl_cffi", SimpleNamespace(requests=SimpleNamespace(Session=FakeCurlSession)))
+    res = epdk._process_report(2025, 7, ["https://example.com/ek", "https://example.com/rapor"])
+    assert res is not None
+    assert res["Tarih"] == "2025-07-01"
+    assert res["TR_Toplam_Ithalat_Ton"] == pytest.approx(1_000_000.0)
+
+
 # ---------------------------------------------------------
 # DGCIS ve GACC testleri
 # ---------------------------------------------------------
@@ -296,6 +356,128 @@ def test_dgcis_wait_select_helpers(monkeypatch):
     dgcis._wait_select_value(drv, wait, "comm", "S5")
     assert sorted_el.selected == "1"
     assert comm_el.selected == "S5"
+
+
+def test_dgcis_marquee_intercept_and_refresh(monkeypatch):
+    import sys
+
+    class FakeInterceptError(Exception):
+        pass
+
+    class FakeOpt:
+        def __init__(self, value, text):
+            self._v = value
+            self.text = text
+
+        def get_attribute(self, name):
+            return self._v if name == "value" else None
+
+    class FakeEl:
+        def __init__(self, opts):
+            self._opts = opts
+            self.selected = None
+
+        def current_options(self):
+            return self._opts
+
+    class BlockingSelect:
+        def __init__(self, el):
+            self.options = el.current_options()
+
+        def select_by_index(self, idx):
+            raise FakeInterceptError("marquee obscures element")
+
+        def select_by_value(self, val):
+            raise FakeInterceptError("marquee obscures element")
+
+    sorted_el = FakeEl([FakeOpt("", "SELECT"), FakeOpt("1", "QTY WISE")])
+    comm_el = FakeEl([FakeOpt("", "SELECT"), FakeOpt("S5", "CRUDE OIL")])
+
+    class FakeDriver:
+        def find_element(self, by, sid):
+            return sorted_el if sid == "sorted" else comm_el
+
+        def execute_script(self, script, *args):
+            if "selectedIndex" in script and len(args) >= 2:
+                el, val_or_idx = args[0], args[1]
+                if isinstance(val_or_idx, int):
+                    el.selected = el._opts[val_or_idx].get_attribute("value")
+                else:
+                    el.selected = val_or_idx
+
+    class FakeWait:
+        def __init__(self, drv):
+            self.drv = drv
+
+        def until(self, cond):
+            for _ in range(5):
+                if cond(self.drv):
+                    return True
+            raise AssertionError("condition never satisfied")
+
+    monkeypatch.setitem(sys.modules, "selenium.webdriver.common.by", SimpleNamespace(By=SimpleNamespace(ID="id", XPATH="xpath")))
+    monkeypatch.setitem(
+        sys.modules,
+        "selenium.common.exceptions",
+        SimpleNamespace(
+            StaleElementReferenceException=RuntimeError,
+            ElementClickInterceptedException=FakeInterceptError,
+            TimeoutException=TimeoutError,
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "selenium.webdriver.support.ui", SimpleNamespace(Select=BlockingSelect, WebDriverWait=lambda d, t: FakeWait(d)))
+    monkeypatch.setitem(
+        sys.modules,
+        "selenium.webdriver.support.expected_conditions",
+        SimpleNamespace(staleness_of=lambda el: (lambda d: True)),
+    )
+
+    drv = FakeDriver()
+    wait = FakeWait(drv)
+    dgcis._wait_select_index(drv, wait, "sorted", 1)
+    dgcis._wait_select_value(drv, wait, "comm", "S5")
+    assert sorted_el.selected == "1"
+    assert comm_el.selected == "S5"
+
+    # _wait_result_refresh: önce {{user.RNUM}} şablonunu yok saymalı, sonra "Total 0 Records" için False dönmeli
+    class FakeNode:
+        def __init__(self, text, displayed=True, html=""):
+            self.text = text
+            self._displayed = displayed
+            self._html = html
+
+        def is_displayed(self):
+            return self._displayed
+
+        def get_attribute(self, name):
+            return self._html
+
+    class RefreshDriver:
+        def __init__(self, steps):
+            self.steps = steps
+            self.idx = 0
+
+        def find_element(self, by, sid):
+            cur = self.steps[min(self.idx, len(self.steps) - 1)]
+            return FakeNode(cur["res_text"], html=cur["html"])
+
+        def find_elements(self, by, xp):
+            cur = self.steps[min(self.idx, len(self.steps) - 1)]
+            self.idx += 1
+            return cur["rows"]
+
+    rdrv = RefreshDriver(
+        [
+            {"res_text": "{{user.RNUM}} Total {{total_count}} Records", "html": "changed", "rows": [FakeNode("{{user.RNUM}}")]},
+            {"res_text": "Total 0 Records", "html": "changed2", "rows": []},
+        ]
+    )
+    assert dgcis._wait_result_refresh(rdrv, FakeWait(rdrv), None, "init") is False
+
+    rdrv_ok = RefreshDriver(
+        [{"res_text": "Total 1 Records", "html": "changed", "rows": [FakeNode("1 S5 CRUDE RUSSIA 1000")]}]
+    )
+    assert dgcis._wait_result_refresh(rdrv_ok, FakeWait(rdrv_ok), None, "init") is True
 
 
 def test_gacc_months_and_missing_years(tmp_path, monkeypatch):

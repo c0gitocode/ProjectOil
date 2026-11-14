@@ -2,7 +2,7 @@
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -22,7 +22,7 @@ MONTHS_TR = {
 _MONTH_PATTERN = "|".join(MONTHS_TR)
 _MONTH_RE = re.compile(rf"(?<![a-zçğıöşü])({_MONTH_PATTERN})(?![a-zçğıöşü])")
 _MONTH_RANGE_RE = re.compile(rf"(?<![a-zçğıöşü])(?:{_MONTH_PATTERN})\s*[-–/]\s*(?:{_MONTH_PATTERN})(?![a-zçğıöşü])")
-_PRIMARY_YM_RE = re.compile(rf"(?<!\d)(20[1-3]\d)\s*yılı\s*({_MONTH_PATTERN})\s*ayı(?![a-zçğıöşü])")
+_PRIMARY_YM_RE = re.compile(rf"(?<!\d)(20[1-3]\d)\s*(?:yılı\s*)?({_MONTH_PATTERN})\s*ayı(?![a-zçğıöşü])")
 _YEAR_RE = re.compile(r"(?<!\d)(20[1-3]\d)(?!\d)")
 
 
@@ -40,6 +40,11 @@ def detect_report_month(text: str) -> Optional[Tuple[int, int]]:
         m = _PRIMARY_YM_RE.search(t)
         if m:
             return int(m.group(1)), MONTHS_TR[m.group(2)]
+        head = re.split(r"\b(?:revize|rev|düzeltme)\b", t, maxsplit=1)[0]
+        h_months = set(_MONTH_RE.findall(head))
+        h_years = set(_YEAR_RE.findall(head))
+        if len(h_months) == 1 and len(h_years) == 1:
+            return int(h_years.pop()), MONTHS_TR[h_months.pop()]
     return None
 
 
@@ -89,32 +94,55 @@ def _is_valid_pdf_bytes(data: bytes) -> bool:
     return data.lstrip().startswith(b"%PDF")
 
 
-def _process_report(year: int, month: int, link: str) -> Optional[Dict]:
+def _process_report(year: int, month: int, link: Union[str, Sequence[str]]) -> Optional[Dict]:
     from curl_cffi import requests as c_requests
+
+    urls = [link] if isinstance(link, str) else list(dict.fromkeys(link))
+    if not urls:
+        return None
 
     out_dir = RAW_DIR / "epdk" / str(year)
     out_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = out_dir / f"epdk_{year}_{month:02d}.pdf"
 
+    parsed: Optional[Tuple[float, float]] = None
     valid_cached = (
         pdf_path.exists()
         and pdf_path.stat().st_size >= 1024
         and _is_valid_pdf_bytes(pdf_path.read_bytes()[:16])
     )
-    if not valid_cached:
-        with c_requests.Session(impersonate="chrome") as s:
-            res = s.get(link, timeout=60)
-            res.raise_for_status()
-            if len(res.content) < 1024 or not _is_valid_pdf_bytes(res.content[:16]):
-                raise ValueError(
-                    f"EPDK {year}-{month:02d} indirilen yanıt geçerli PDF değil (HTML hata sayfası olabilir)."
-                )
-            pdf_path.write_bytes(res.content)
+    if valid_cached:
+        parsed = parse_pdf(pdf_path)
 
-    parsed = parse_pdf(pdf_path)
-    if not parsed:
-        log.warning("EPDK %d-%02d: PDF içinde ithalat tablosu bulunamadı (%s)", year, month, pdf_path.name)
-        return None
+    if parsed is None:
+        saw_valid_pdf = valid_cached
+        last_err: Optional[Exception] = None
+        with c_requests.Session(impersonate="chrome") as s:
+            for idx, url in enumerate(urls):
+                try:
+                    res = s.get(url, timeout=60)
+                    res.raise_for_status()
+                except Exception as exc:  # noqa: BLE001
+                    last_err = exc
+                    continue
+                if len(res.content) < 1024 or not _is_valid_pdf_bytes(res.content[:16]):
+                    last_err = ValueError(
+                        f"EPDK {year}-{month:02d} indirilen yanıt geçerli PDF değil (HTML hata sayfası olabilir)."
+                    )
+                    continue
+                saw_valid_pdf = True
+                pdf_path.write_bytes(res.content)
+                parsed = parse_pdf(pdf_path)
+                if parsed is not None:
+                    break
+                if idx < len(urls) - 1:
+                    pdf_path.unlink(missing_ok=True)
+
+        if parsed is None:
+            if not saw_valid_pdf and last_err is not None:
+                raise last_err
+            log.warning("EPDK %d-%02d: PDF içinde ithalat tablosu bulunamadı (%s)", year, month, pdf_path.name)
+            return None
 
     total_t, russia_t = parsed
     total_kbd = tonnes_to_kbd_scalar(total_t, year, month)
@@ -191,7 +219,7 @@ def _link_candidates(a) -> List[str]:
 
 def _collect_report_links(html: str, start_year: int) -> Tuple[Dict[Tuple[int, int], str], Dict[str, object]]:
     soup = BeautifulSoup(html, "html.parser")
-    links: Dict[Tuple[int, int], str] = {}
+    ranked: Dict[Tuple[int, int], List[Tuple[int, int, str]]] = {}
     stats: Dict[str, object] = {
         "doc_links": 0,
         "skipped_il_bazinda": 0,
@@ -199,9 +227,10 @@ def _collect_report_links(html: str, start_year: int) -> Tuple[Dict[Tuple[int, i
         "skipped_no_date": 0,
         "skipped_old": 0,
         "samples": [],
+        "candidates_by_ym": {},
     }
 
-    for a in soup.find_all("a", href=True):
+    for idx, a in enumerate(soup.find_all("a", href=True)):
         href = a["href"]
         href_low = href.lower()
         if "downloaddocument" not in href_low and not href_low.endswith(".pdf"):
@@ -233,18 +262,6 @@ def _collect_report_links(html: str, start_year: int) -> Tuple[Dict[Tuple[int, i
             stats["skipped_non_pdf"] = int(stats["skipped_non_pdf"]) + 1
             continue
 
-        is_pdf = (
-            "pdf" in meta
-            or href_low.endswith(".pdf")
-            or ("pdf" in tr_lower(" ".join(candidates)))
-            or ("rapor" in low and a.find("img") is None and ym is not None)
-        )
-        if not is_pdf:
-            stats["skipped_non_pdf"] = int(stats["skipped_non_pdf"]) + 1
-            if len(stats["samples"]) < 5:  # type: ignore[arg-type]
-                stats["samples"].append(f"non_pdf: {context_text[:70]} [{href[:40]}]")  # type: ignore[attr-defined]
-            continue
-
         if ym is None:
             stats["skipped_no_date"] = int(stats["skipped_no_date"]) + 1
             log.debug("EPDK link atlandı (ay/yıl belirsiz): %s", context_text[:80])
@@ -256,7 +273,21 @@ def _collect_report_links(html: str, start_year: int) -> Tuple[Dict[Tuple[int, i
             stats["skipped_old"] = int(stats["skipped_old"]) + 1
             continue
 
-        links.setdefault(ym, "https://www.epdk.gov.tr" + href if href.startswith("/") else href)
+        has_pdf_hint = "pdf" in meta or href_low.endswith(".pdf") or ("pdf" in tr_lower(" ".join(candidates)))
+        # Öncelik: 0=açık PDF etiketi/ikonu, 1=başlıkta "rapor" geçen DownloadDocument, 2=diğer tarihli linkler.
+        # Gerçek PDF olup olmadığı _process_report içinde b"%PDF" ile kesin doğrulanır.
+        priority = 0 if has_pdf_hint else (1 if "rapor" in low else 2)
+        url = "https://www.epdk.gov.tr" + href if href.startswith("/") else href
+        ranked.setdefault(ym, []).append((priority, idx, url))
+
+    links: Dict[Tuple[int, int], str] = {}
+    candidates_by_ym: Dict[Tuple[int, int], List[str]] = {}
+    for ym, items in ranked.items():
+        ordered = [u for _, _, u in sorted(items, key=lambda t: (t[0], t[1]))]
+        deduped = list(dict.fromkeys(ordered))
+        links[ym] = deduped[0]
+        candidates_by_ym[ym] = deduped
+    stats["candidates_by_ym"] = candidates_by_ym
     return links, stats
 
 
@@ -287,7 +318,8 @@ def update(max_workers: int = 3) -> None:
         res.raise_for_status()
     start_year = pd.Timestamp(START_DATE).year
     links, link_stats = _collect_report_links(res.text, start_year)
-    todo = {ym: l for ym, l in links.items() if f"{ym[0]}-{ym[1]:02d}-01" not in done}
+    candidates_by_ym: Dict[Tuple[int, int], List[str]] = link_stats["candidates_by_ym"]  # type: ignore[assignment]
+    todo = {ym: candidates_by_ym.get(ym, [l]) for ym, l in links.items() if f"{ym[0]}-{ym[1]:02d}-01" not in done}
     log.info("EPDK: %d rapor linki bulundu, %d yeni.", len(links), len(todo))
     if len(links) < 24 and pd.Timestamp.now().year - start_year >= 2:
         log.warning(
@@ -306,7 +338,7 @@ def update(max_workers: int = 3) -> None:
 
     rows, failed = [], []
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(_process_report, y, m, l): (y, m) for (y, m), l in todo.items()}
+        futures = {ex.submit(_process_report, y, m, urls): (y, m) for (y, m), urls in todo.items()}
         for f in as_completed(futures):
             y, m = futures[f]
             try:
