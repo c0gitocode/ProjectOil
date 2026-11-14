@@ -37,13 +37,14 @@ def test_full_pipeline_skip_extract_e2e(tmp_path, monkeypatch):
     monkeypatch.setattr(viz, "END_DATE", "2024-12-01")
 
     rng = np.random.default_rng(123)
-    # 1) JODI (JP, DE, KR + IN)
+    # 1) JODI (JP, DE, KR + IN + CN; CN hem çift sayım korumasını hem GACC çapraz doğrulamasını sınar)
     jodi_df = pd.DataFrame(
         {
             "JP": 2500.0 + rng.normal(0, 40, len(dates)),
             "DE": 1700.0 + rng.normal(0, 30, len(dates)),
             "KR": 2800.0 + rng.normal(0, 45, len(dates)),
             "IN": 4500.0 + rng.normal(0, 60, len(dates)),
+            "CN": 3250.0 + rng.normal(0, 50, len(dates)),
         },
         index=dates,
     )
@@ -74,56 +75,71 @@ def test_full_pipeline_skip_extract_e2e(tmp_path, monkeypatch):
             dgcis_rows.append({"Period": d.strftime("%b-%Y"), "Unit": "TON", "Qty": ton})
     pd.DataFrame(dgcis_rows).to_csv(config.FILES["dgcis"], index=False)
 
-    # 5) GACC ham yıllık Çin CSV'leri
+    # 5) GACC ham yıllık Çin CSV'leri (post-2022 Rusya hacim/iskonto artışı + Malezya dahil)
     for y in range(2020, 2025):
         gacc_rows = []
         for m in range(1, 13):
-            gacc_rows.append(
-                {
-                    "Date of data": f"{y}-{m:02d}",
-                    "Trading partner": "Russia",
-                    "Quantity": str(int(6_500_000_000 + rng.normal(0, 1e8))),
-                    "US dollar": "3500000000",
-                }
-            )
-            gacc_rows.append(
-                {
-                    "Date of data": f"{y}-{m:02d}",
-                    "Trading partner": "Saudi Arabia",
-                    "Quantity": str(int(7_000_000_000 + rng.normal(0, 1e8))),
-                    "US dollar": "4000000000",
-                }
-            )
+            is_post = (y, m) >= (2022, 2)
+            rus_qty = (8_000_000_000 if is_post else 5_500_000_000) + int(rng.normal(0, 1e8))
+            rus_usd = (3_300_000_000 if is_post else 2_900_000_000) + int(rng.normal(0, 4e7))
+            sau_qty = 6_500_000_000 + int(rng.normal(0, 1e8))
+            sau_usd = 3_900_000_000 + int(rng.normal(0, 4e7))
+            gacc_rows.append({"Date of data": f"{y}-{m:02d}", "Trading partner": "Russia", "Quantity": str(rus_qty), "US dollar": str(rus_usd)})
+            gacc_rows.append({"Date of data": f"{y}-{m:02d}", "Trading partner": "Saudi Arabia", "Quantity": str(sau_qty), "US dollar": str(sau_usd)})
+            if is_post:
+                gacc_rows.append({"Date of data": f"{y}-{m:02d}", "Trading partner": "Malaysia", "Quantity": "1200000000", "US dollar": "650000000"})
         pd.DataFrame(gacc_rows).to_csv(china_dir / f"{y}_china.csv", index=False)
 
     rc = pipeline_main.main(["--skip-extract"])
     assert rc == 0
 
     # Çıktı CSV'leri
-    for key in ("tr_master", "china_imports", "china_payment", "india", "global", "panel"):
+    for key in ("tr_master", "china_imports", "china_payment", "india", "global", "zero_global", "panel"):
         assert config.FILES[key].exists(), f"Eksik çıktı: {key}"
 
     # SQLite tabloları ve _metadata
     with sqlite3.connect(proc_dir / "oil_database.db") as conn:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        assert {"global_petrodollar_petroyuan", "panel_long", "china_payment", "india_analysis", "_metadata"} <= tables
+        assert {
+            "global_petrodollar_petroyuan",
+            "global_zero_assumption",
+            "panel_long",
+            "china_payment",
+            "india_analysis",
+            "_metadata",
+        } <= tables
         global_rows = conn.execute("SELECT COUNT(*) FROM global_petrodollar_petroyuan").fetchone()[0]
+        zero_rows = conn.execute("SELECT COUNT(*) FROM global_zero_assumption").fetchone()[0]
         assert global_rows == 60
+        assert zero_rows == 60
 
-    # Ekonometri & Grafikler
-    assert (out_dir / "econometrics_report.txt").exists()
-    assert (out_dir / "econometrics_summary.csv").exists()
-    assert (out_dir / "econometrics_sensitivity.csv").exists()
-    assert (out_dir / "econometrics_panel_summary.csv").exists()
+    # Ekonometri & Sıfır Varsayım & Olay Çalışması raporları
+    for fname in (
+        "econometrics_report.txt",
+        "econometrics_summary.csv",
+        "econometrics_sensitivity.csv",
+        "econometrics_panel_summary.csv",
+        "econometrics_panel_event_study.csv",
+        "econometrics_zero_assumption_summary.csv",
+        "econometrics_zero_assumption_report.txt",
+        "econometrics_discount_mechanism.csv",
+    ):
+        assert (out_dir / fname).exists(), f"Eksik ekonometri çıktısı: {fname}"
+
+    sens = pd.read_csv(out_dir / "econometrics_sensitivity.csv")
+    assert {"Strict (Yalnızca Yaptırımlı)", "Sabit Oran (Merdivensiz %50)"} <= set(sens["senaryo"])
 
     for img in (
         "petrodolar_vs_petroyuan_global.png",
         "petroyuan_share_global.png",
         "china_yuan_dolar_oran_trend.png",
         "hindistan_genel_hacim_odeme_trend_guncel.png",
+        "zero_assumption_shares.png",
+        "china_russia_discount_vs_share.png",
+        "panel_did_event_study.png",
     ):
         p = out_dir / img
-        assert p.exists() and p.stat().st_size > 10_000
+        assert p.exists() and p.stat().st_size > 10_000, f"Eksik/küçük grafik: {img}"
 
     # --only-analysis modu mevcut processed verilerle tek başına çalışabilmeli
     rc_only = pipeline_main.main(["--only-analysis"])

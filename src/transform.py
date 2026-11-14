@@ -529,6 +529,169 @@ def run_global() -> bool:
     return True
 
 
+def compute_zero_assumption_global(
+    jodi_kbd: pd.DataFrame,
+    us: pd.DataFrame,
+    tr: pd.DataFrame,
+    dgcis_rus: pd.Series,
+    china_imports: pd.DataFrame,
+    start: str = START_DATE,
+    end: str = END_DATE,
+) -> pd.DataFrame:
+    """Sıfır varsayımlı (pure customs / EPDK / JODI / EIA) küresel yaptırımlı akım ve fiyat farkı tablosu.
+
+    Hiçbir tahmini ödeme para birimi katsayısı (alt_share) kullanılmaz; doğrudan resmi gümrük ve
+    düzenleyici kurum miktarları (KBD) ile Çin gümrük birim fiyatları (USD/varil) işlenir.
+    """
+    def monthly_idx(obj):
+        obj = obj.copy()
+        obj.index = pd.to_datetime(obj.index).to_period("M").to_timestamp()
+        obj = obj.sort_index()
+        return obj[~obj.index.duplicated(keep="last")]
+
+    imp = china_imports.copy()
+    imp["Date"] = pd.to_datetime(imp["Date"]).dt.to_period("M").dt.to_timestamp()
+    world_df = imp[imp["Partner"] == "World"]
+    if world_df.empty and not imp.empty:
+        cn_world = monthly_idx(imp.groupby("Date")["KBD"].sum(min_count=1))
+    else:
+        cn_world = monthly_idx(world_df.set_index("Date")["KBD"])
+    non_world = imp[imp["Partner"] != "World"].copy()
+    non_world["group"] = non_world["Partner"].str.lower().str.strip().map(CHINA_PARTNER_GROUPS)
+
+    by_group = (
+        non_world.dropna(subset=["group"])
+        .pivot_table(index="Date", columns="group", values="KBD", aggfunc="sum")
+        .reindex(cn_world.index)
+        .fillna(0.0)
+    )
+    cn_rus = by_group["russia"] if "russia" in by_group.columns else pd.Series(0.0, index=cn_world.index)
+    cn_iv = by_group["iran_venezuela"] if "iran_venezuela" in by_group.columns else pd.Series(0.0, index=cn_world.index)
+    cn_mal = by_group["malaysia"] if "malaysia" in by_group.columns else pd.Series(0.0, index=cn_world.index)
+
+    # Çin gümrük birim fiyat iskontosu (Rusya vs yaptırımsız diğer tedarikçiler, $/varil)
+    valid_px = non_world.dropna(subset=["USD", "Quantity_kg"]).copy()
+    valid_px = valid_px[(valid_px["USD"] > 0) & (valid_px["Quantity_kg"] > 0)]
+    valid_px["bbl"] = valid_px["Quantity_kg"] / 1000.0 * BBL_PER_TONNE
+
+    rus_px_grp = valid_px[valid_px["group"] == "russia"].groupby("Date")[["USD", "bbl"]].sum()
+    cn_rus_usd_bbl = (rus_px_grp["USD"] / rus_px_grp["bbl"]).where(rus_px_grp["bbl"] > 0).reindex(cn_world.index)
+
+    bench_mask = ~valid_px["group"].isin(["russia", "iran_venezuela", "malaysia"])
+    bench_grp = valid_px[bench_mask].groupby("Date")[["USD", "bbl"]].sum()
+    cn_bench_usd_bbl = (bench_grp["USD"] / bench_grp["bbl"]).where(bench_grp["bbl"] > 0).reindex(cn_world.index)
+
+    jodi_m = monthly_idx(jodi_kbd)
+    jodi_other = monthly_idx(compute_jodi_other(jodi_m, start=start, end=end)["JODI_DIGER_KBD"])
+    in_cols = [c for c in ("IN", "IND") if c in jodi_m.columns]
+    in_tot = jodi_m[in_cols].sum(axis=1, min_count=1) if in_cols else pd.Series(np.nan, index=jodi_m.index)
+
+    cn_jodi_cols = [c for c in ("CN", "CHN") if c in jodi_m.columns]
+    jodi_cn = jodi_m[cn_jodi_cols].sum(axis=1, min_count=1) if cn_jodi_cols else pd.Series(np.nan, index=jodi_m.index)
+
+    us_m = monthly_idx(us["ABD_Ithalat_KBD"])
+    tr_df = monthly_idx(tr)
+    tr_tot = tr_df["TR_Toplam_Ithalat_KBD"] if "TR_Toplam_Ithalat_KBD" in tr_df.columns else pd.Series(np.nan, index=tr_df.index)
+    tr_rus = tr_df["TR_Rusya_Ithalat_KBD"] if "TR_Rusya_Ithalat_KBD" in tr_df.columns else pd.Series(np.nan, index=tr_df.index)
+    dgcis_m = monthly_idx(dgcis_rus) if not dgcis_rus.empty else pd.Series(dtype=float)
+
+    df = pd.DataFrame(
+        {
+            "JODI_DIGER_KBD": jodi_other,
+            "US_Total_KBD": us_m,
+            "TR_Total_KBD": tr_tot,
+            "TR_Russia_KBD": tr_rus,
+            "CN_Total_KBD": cn_world,
+            "CN_Russia_KBD": cn_rus,
+            "CN_Iran_Ven_KBD": cn_iv,
+            "CN_Malaysia_KBD": cn_mal,
+            "CN_Russia_USD_bbl": cn_rus_usd_bbl,
+            "CN_Benchmark_USD_bbl": cn_bench_usd_bbl,
+            "IN_Total_KBD": in_tot,
+            "IN_Russia_KBD": dgcis_m,
+            "JODI_CN_KBD": jodi_cn,
+        }
+    ).sort_index().loc[start:end]
+    df.index.name = "Date"
+
+    # Fiziki sınır koruması (DGCIS Rusya ithalatı JODI Hindistan toplamını aşamaz; öncesi NaN korunur)
+    both_in = df["IN_Russia_KBD"].notna() & df["IN_Total_KBD"].notna()
+    df.loc[both_in, "IN_Russia_KBD"] = np.minimum(df.loc[both_in, "IN_Russia_KBD"], df.loc[both_in, "IN_Total_KBD"])
+    both_tr = df["TR_Russia_KBD"].notna() & df["TR_Total_KBD"].notna()
+    df.loc[both_tr, "TR_Russia_KBD"] = np.clip(df.loc[both_tr, "TR_Russia_KBD"], 0.0, df.loc[both_tr, "TR_Total_KBD"])
+
+    df["CN_Strict_KBD"] = df["CN_Russia_KBD"] + df["CN_Iran_Ven_KBD"]
+    df["CN_Broad_KBD"] = df["CN_Strict_KBD"] + df["CN_Malaysia_KBD"]
+    df["CN_Russia_Share_Pct"] = (df["CN_Russia_KBD"] / df["CN_Total_KBD"] * 100.0).where(df["CN_Total_KBD"] > 0)
+    df["CN_Strict_Share_Pct"] = (df["CN_Strict_KBD"] / df["CN_Total_KBD"] * 100.0).where(df["CN_Total_KBD"] > 0)
+    df["CN_Broad_Share_Pct"] = (df["CN_Broad_KBD"] / df["CN_Total_KBD"] * 100.0).where(df["CN_Total_KBD"] > 0)
+    df["CN_Russia_Discount_USD_bbl"] = df["CN_Benchmark_USD_bbl"] - df["CN_Russia_USD_bbl"]
+
+    df["TR_Russia_Share_Pct"] = (df["TR_Russia_KBD"] / df["TR_Total_KBD"] * 100.0).where(df["TR_Total_KBD"] > 0)
+    df["IN_Russia_Share_Pct"] = (df["IN_Russia_KBD"] / df["IN_Total_KBD"] * 100.0).where(df["IN_Total_KBD"] > 0)
+
+    tot_cols = ["JODI_DIGER_KBD", "US_Total_KBD", "TR_Total_KBD", "CN_Total_KBD", "IN_Total_KBD"]
+    complete_tot = df[tot_cols].notna().all(axis=1)
+    df["Global_Total_KBD"] = df[tot_cols].sum(axis=1).where(complete_tot)
+
+    # Tam örneklem (2018-01+) Çin+Türkiye yaptırımlı akımları
+    df["CN_TR_Sanctioned_Strict_KBD"] = (df["CN_Strict_KBD"] + df["TR_Russia_KBD"]).where(
+        df["CN_Strict_KBD"].notna() & df["TR_Russia_KBD"].notna()
+    )
+    df["CN_TR_Sanctioned_Broad_KBD"] = (df["CN_Broad_KBD"] + df["TR_Russia_KBD"]).where(
+        df["CN_Broad_KBD"].notna() & df["TR_Russia_KBD"].notna()
+    )
+    df["CN_TR_Sanctioned_Strict_Share_Pct"] = (
+        df["CN_TR_Sanctioned_Strict_KBD"] / df["Global_Total_KBD"] * 100.0
+    ).where(df["Global_Total_KBD"] > 0)
+    df["CN_TR_Sanctioned_Broad_Share_Pct"] = (
+        df["CN_TR_Sanctioned_Broad_KBD"] / df["Global_Total_KBD"] * 100.0
+    ).where(df["Global_Total_KBD"] > 0)
+
+    # DGCIS dahil tam küresel sıfır varsayım (2021-04+)
+    has_strict_all = (
+        df["CN_Strict_KBD"].notna()
+        & df["IN_Russia_KBD"].notna()
+        & df["TR_Russia_KBD"].notna()
+        & (df["Global_Total_KBD"] > 0)
+    )
+    df["Zero_Strict_KBD"] = (df["CN_Strict_KBD"] + df["IN_Russia_KBD"] + df["TR_Russia_KBD"]).where(has_strict_all)
+    df["Zero_Strict_Share_Pct"] = (df["Zero_Strict_KBD"] / df["Global_Total_KBD"] * 100.0).where(has_strict_all)
+
+    has_all_broad = has_strict_all & df["CN_Broad_KBD"].notna()
+    df["Zero_Broad_KBD"] = (df["CN_Broad_KBD"] + df["IN_Russia_KBD"] + df["TR_Russia_KBD"]).where(has_all_broad)
+    df["Zero_Broad_Share_Pct"] = (df["Zero_Broad_KBD"] / df["Global_Total_KBD"] * 100.0).where(has_all_broad)
+    df["Zero_Traditional_KBD"] = (df["Global_Total_KBD"] - df["Zero_Broad_KBD"]).clip(lower=0.0).where(has_all_broad)
+
+    df["GACC_vs_JODI_CN_Diff_Pct"] = (
+        (df["CN_Total_KBD"] - df["JODI_CN_KBD"]) / df["JODI_CN_KBD"] * 100.0
+    ).where(df["JODI_CN_KBD"] > 0)
+    return df.round(3)
+
+
+def run_zero_assumption() -> bool:
+    req = ["jodi", "eia", "epdk", "china_imports"]
+    if missing := [k for k in req if not FILES[k].exists()]:
+        log.warning("Sıfır varsayım tablosu için eksik dosyalar: %s", [FILES[k].name for k in missing])
+        return False
+
+    jodi = pd.read_csv(FILES["jodi"], index_col=0, parse_dates=True)
+    us = pd.read_csv(FILES["eia"], index_col=0, parse_dates=True)
+    tr = _read_epdk().set_index("Tarih")
+    dgcis = pd.read_csv(FILES["dgcis"]) if FILES["dgcis"].exists() else pd.DataFrame(columns=["Period", "Qty"])
+    china_imp = pd.read_csv(FILES["china_imports"], parse_dates=["Date"])
+
+    z = compute_zero_assumption_global(jodi, us, tr, compute_dgcis_russia_kbd(dgcis), china_imp)
+    atomic_write_csv(z, FILES["zero_global"])
+    valid_global = z["Zero_Broad_Share_Pct"].dropna()
+    log.info(
+        "Sıfır varsayım küresel seri yazıldı: %d ay (tam DGCIS dahil: %d ay)",
+        int(z["Global_Total_KBD"].notna().sum()),
+        len(valid_global),
+    )
+    return not z.empty
+
+
 def run_all() -> Dict[str, bool]:
     results = {}
     for name, fn in (
@@ -536,6 +699,7 @@ def run_all() -> Dict[str, bool]:
         ("china", run_china),
         ("india", run_india),
         ("global", run_global),
+        ("zero_assumption", run_zero_assumption),
     ):
         try:
             results[name] = fn() is not False

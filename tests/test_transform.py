@@ -128,3 +128,55 @@ def test_compute_jodi_other_balanced_basket_and_panel_unsorted_index():
     # US/TR/IN JODI kaynaklı çift kayıt içermemeli (bölge x tarih tekil)
     assert panel.duplicated(subset=["Date", "region"]).sum() == 0
     assert panel.loc[panel["region"] == "CN", "petroyuan_share_pct"].iloc[0] == pytest.approx(20.0)
+
+
+def test_compute_zero_assumption_global_strict_broad_discount_and_no_backfill():
+    dates = pd.to_datetime(["2021-01-01", "2021-06-01", "2022-06-01"])
+    jodi = pd.DataFrame(
+        {
+            "JP": [2000.0, 2000.0, 2000.0],
+            "IN": [4000.0, 4200.0, 4500.0],
+            "CN": [10000.0, 10000.0, 10000.0],
+        },
+        index=dates,
+    )
+    us = pd.DataFrame({"ABD_Ithalat_KBD": [6000.0, 6000.0, 6000.0]}, index=dates)
+    tr = pd.DataFrame(
+        {"TR_Toplam_Ithalat_KBD": [600.0, 600.0, 700.0], "TR_Rusya_Ithalat_KBD": [100.0, 120.0, 350.0]},
+        index=dates,
+    )
+    # 2021-01 için DGCIS yok -> NaN kalmalı; 2022-06'da taşma varsa IN_Total ile kırpılmalı
+    dgcis_rus = pd.Series([800.0, 9999.0], index=pd.to_datetime(["2021-06-01", "2022-06-01"]))
+
+    # 1 varil = 1/7.33 ton -> kolay doğrulama için kg = n_bbl / BBL_PER_TONNE * 1000
+    kg_per_bbl = 1000.0 / config.BBL_PER_TONNE
+    gacc_rows = []
+    for d in dates:
+        # 10,000 bbl Russia @ $50/bbl, 5,000 bbl Malaysia @ $60/bbl, 10,000 bbl Saudi @ $80/bbl
+        gacc_rows.append({"Date": d, "Partner": "Russia", "Quantity_kg": 1000.0 * kg_per_bbl, "USD": 50_000.0, "KBD": 1000.0})
+        gacc_rows.append({"Date": d, "Partner": "Malaysia", "Quantity_kg": 500.0 * kg_per_bbl, "USD": 30_000.0, "KBD": 500.0})
+        gacc_rows.append({"Date": d, "Partner": "Saudi Arabia", "Quantity_kg": 1000.0 * kg_per_bbl, "USD": 80_000.0, "KBD": 1000.0})
+        gacc_rows.append({"Date": d, "Partner": "World", "Quantity_kg": 2500.0 * kg_per_bbl, "USD": 160_000.0, "KBD": 10_000.0})
+    china_imp = pd.DataFrame(gacc_rows)
+
+    z = transform.compute_zero_assumption_global(
+        jodi, us, tr, dgcis_rus, china_imp, start="2021-01-01", end="2022-06-01"
+    )
+    # 2021-01: DGCIS eksik -> IN_Russia_KBD ve Zero_Strict/Broad NaN kalmalı, CN+TR yine dolu olmalı
+    assert pd.isna(z.loc["2021-01-01", "IN_Russia_KBD"])
+    assert pd.isna(z.loc["2021-01-01", "Zero_Broad_Share_Pct"])
+    assert z.loc["2021-01-01", "CN_TR_Sanctioned_Strict_KBD"] == pytest.approx(1100.0)
+    assert z.loc["2021-01-01", "CN_TR_Sanctioned_Broad_KBD"] == pytest.approx(1600.0)
+
+    # Fiyat farkı kontrolü: Benchmark ($80) - Russia ($50) = $30/bbl
+    assert z.loc["2021-06-01", "CN_Russia_Discount_USD_bbl"] == pytest.approx(30.0)
+    assert z.loc["2021-06-01", "GACC_vs_JODI_CN_Diff_Pct"] == pytest.approx(0.0)
+
+    # 2021-06: Strict = 1000 (CN) + 800 (IN) + 120 (TR) = 1920; Broad = +500 (MY) = 2420
+    assert z.loc["2021-06-01", "Zero_Strict_KBD"] == pytest.approx(1920.0)
+    assert z.loc["2021-06-01", "Zero_Broad_KBD"] == pytest.approx(2420.0)
+
+    # 2022-06: IN_Russia_KBD (9999) JODI toplamıyla (4500) kırpılmalı
+    assert z.loc["2022-06-01", "IN_Russia_KBD"] == pytest.approx(4500.0)
+    assert z.loc["2022-06-01", "Zero_Strict_KBD"] == pytest.approx(1000.0 + 4500.0 + 350.0)
+    assert z.loc["2022-06-01", "Zero_Broad_KBD"] == pytest.approx(1500.0 + 4500.0 + 350.0)

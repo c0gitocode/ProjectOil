@@ -12,6 +12,7 @@ log = get_logger(__name__)
 # tablo adı -> (dosya anahtarı, tarih index'li mi)
 TABLES = {
     "global_petrodollar_petroyuan": ("global", True),
+    "global_zero_assumption": ("zero_global", True),
     "panel_long": ("panel", False),
     "china_payment": ("china_payment", True),
     "china_imports": ("china_imports", False),

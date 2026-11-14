@@ -45,8 +45,9 @@ if __name__ == "__main__" and not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     __package__ = "src"
 
-from .config import BREAK_DATE, END_DATE, FILES, OUTPUTS_DIR, START_DATE
+from .config import ASSUMPTION_FILES, BREAK_DATE, END_DATE, FILES, OUTPUTS_DIR, START_DATE
 from .logger import get_logger, setup_logging
+from .transform import load_shares, shares_for_dates
 
 log = get_logger(__name__)
 
@@ -54,6 +55,18 @@ TARGETS = {
     "GLOBAL_PETRODOLAR": "Global Petrodolar (KBD)",
     "GLOBAL_PETROYUAN": "Global Petroyuan (KBD)",
     "PETROYUAN_SHARE_PCT": "Petroyuan Payı (%)",
+}
+
+ZERO_TARGETS = {
+    "CN_Russia_Share_Pct": "Çin Rusya Ham Petrol Payı — GACC (%)",
+    "CN_Strict_Share_Pct": "Çin Yaptırımlı Payı — Strict: Rusya+İran+Ven (%)",
+    "CN_Broad_Share_Pct": "Çin Yaptırımlı Payı — Broad: +Malezya (%)",
+    "TR_Russia_Share_Pct": "Türkiye Rusya Ham Petrol Payı — EPDK (%)",
+    "CN_TR_Sanctioned_Strict_Share_Pct": "Küresel Kapsanan Pay — Çin+TR Strict (%)",
+    "CN_TR_Sanctioned_Broad_Share_Pct": "Küresel Kapsanan Pay — Çin+TR Broad (%)",
+    "IN_Russia_Share_Pct": "Hindistan Rusya Payı — DGCIS/JODI, 2021-04+ (%)",
+    "Zero_Strict_Share_Pct": "Küresel Sıfır Varsayım Payı — Strict, 2021-04+ (%)",
+    "Zero_Broad_Share_Pct": "Küresel Sıfır Varsayım Payı — Broad, 2021-04+ (%)",
 }
 
 # Andrews (1993), Econometrica 61(4), Table 1: p = 2 (const, trend), trimming pi_0 = 0.15
@@ -555,6 +568,414 @@ def panel_fe_did(
     return pd.DataFrame(rows)
 
 
+def _monthly_index(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out.index = pd.to_datetime(out.index).to_period("M").to_timestamp()
+    out = out.sort_index()
+    return out[~out.index.duplicated(keep="last")]
+
+
+def constant_share_robustness(
+    global_df: pd.DataFrame,
+    china_pay: Optional[pd.DataFrame] = None,
+    india_df: Optional[pd.DataFrame] = None,
+    china_shares: Optional[pd.DataFrame] = None,
+    break_date: str = BREAK_DATE,
+) -> pd.DataFrame:
+    """Merdivensiz / sabit-oran ve Malezya'sız Strict sağlamlık testi.
+
+    Varsayım merdiveninin (2022-2025 arası yükselen alt_share) sonuçları tek başına yaratıp
+    yaratmadığını sınamak için:
+      1) Strict (Malezya/Suudi/Brezilya hariç, yalnızca Rusya + İran + Venezuela)
+      2) Sabit Oran 2022+ (Merdivensiz %50): Savaş sonrası tüm aylarda alt_share=%50 sabitlenir;
+         böylece kırılma sonrası büyüme tamamen gerçek fiziksel ithalat hacminden gelir.
+    """
+    if china_pay is None or india_df is None or global_df.empty or "GLOBAL_TOTAL_KBD" not in global_df.columns:
+        return pd.DataFrame()
+    req_cn = {"CN_russia_KBD", "CN_iran_venezuela_KBD"}
+    req_in = {"Rusya_Ithalat_KBD", "Toplam_Ithalat_KBD", "Petroyuan_KBD"}
+    if not req_cn <= set(china_pay.columns) or not req_in <= set(india_df.columns):
+        return pd.DataFrame()
+
+    if china_shares is None:
+        if not ASSUMPTION_FILES["china"].exists():
+            return pd.DataFrame()
+        china_shares = load_shares(ASSUMPTION_FILES["china"])
+
+    g_m = _monthly_index(global_df).dropna(subset=["GLOBAL_TOTAL_KBD"])
+    cn_m = _monthly_index(china_pay).reindex(g_m.index)
+    in_m = _monthly_index(india_df).reindex(g_m.index)
+    if g_m.empty:
+        return pd.DataFrame()
+
+    sh_base = shares_for_dates(china_shares, g_m.index)
+    bd = pd.Timestamp(break_date)
+    is_post = pd.Series(g_m.index >= bd, index=g_m.index)
+    total = g_m["GLOBAL_TOTAL_KBD"].replace(0, np.nan)
+
+    # 1) Strict: Yalnızca doğrudan yaptırımlı ülkeler (CN_russia + CN_iran_venezuela + IN_Russia baseline pay)
+    cn_strict = (
+        cn_m["CN_russia_KBD"] * sh_base.get("russia", 0.0)
+        + cn_m["CN_iran_venezuela_KBD"] * sh_base.get("iran_venezuela", 0.0)
+    )
+    py_strict = cn_strict + in_m["Petroyuan_KBD"]
+
+    # 2) Sabit Oran 2022+ (Merdivensiz %50): Post dönemde 0.50 sabit oran (hiç adım artışı yok)
+    sh_rus_const = sh_base.get("russia", pd.Series(0.0, index=g_m.index)).where(~is_post, 0.50)
+    sh_iv_const = sh_base.get("iran_venezuela", pd.Series(0.0, index=g_m.index)).where(~is_post, 0.50)
+    cn_const = cn_m["CN_russia_KBD"] * sh_rus_const + cn_m["CN_iran_venezuela_KBD"] * sh_iv_const
+    in_const = pd.Series(0.0, index=g_m.index).where(
+        ~is_post,
+        np.minimum(0.50 * in_m["Rusya_Ithalat_KBD"], in_m["Toplam_Ithalat_KBD"]),
+    )
+    py_const = cn_const + in_const
+
+    scenarios = [
+        ("Global Petroyuan (KBD)", "Strict (Yalnızca Yaptırımlı)", py_strict),
+        ("Petroyuan Payı (%)", "Strict (Yalnızca Yaptırımlı)", py_strict / total * 100.0),
+        ("Global Petroyuan (KBD)", "Sabit Oran (Merdivensiz %50)", py_const),
+        ("Petroyuan Payı (%)", "Sabit Oran (Merdivensiz %50)", py_const / total * 100.0),
+    ]
+
+    rows = []
+    for target_name, scen_name, series in scenarios:
+        s = series.dropna()
+        if len(s) < 18 or (s.index < bd).sum() < 2 or (s.index >= bd).sum() < 2:
+            continue
+        lvl, _ = its_regression(s, break_date, seasonal=True)
+        diff, _ = its_diff_regression(s, break_date, seasonal=True)
+        rows.append(
+            {
+                "seri": target_name,
+                "senaryo": scen_name,
+                "its_level_shift": float(lvl.params["post"]),
+                "its_level_p": float(lvl.pvalues["post"]),
+                "its_slope_change": float(lvl.params["post_trend"]),
+                "its_slope_p": float(lvl.pvalues["post_trend"]),
+                "diff_level_shift": float(diff.params["d_post"]),
+                "diff_level_p": float(diff.pvalues["d_post"]),
+                "diff_slope_change": float(diff.params["post_lag"]),
+                "diff_slope_p": float(diff.pvalues["post_lag"]),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def cross_validate_gacc_jodi(zero_df: pd.DataFrame) -> Dict[str, float]:
+    """Çin gümrük (GACC) ile JODI Çin ham petrol toplamlarını çapraz doğrular."""
+    if zero_df.empty or not {"CN_Total_KBD", "JODI_CN_KBD"} <= set(zero_df.columns):
+        return {"n": 0, "pearson_r": float("nan"), "pearson_p": float("nan"), "mape_pct": float("nan"), "mean_diff_pct": float("nan"), "median_abs_diff_pct": float("nan")}
+
+    sub = zero_df.dropna(subset=["CN_Total_KBD", "JODI_CN_KBD"]).copy()
+    sub = sub[sub["JODI_CN_KBD"] > 0]
+    n = len(sub)
+    if n < 2:
+        return {"n": int(n), "pearson_r": float("nan"), "pearson_p": float("nan"), "mape_pct": float("nan"), "mean_diff_pct": float("nan"), "median_abs_diff_pct": float("nan")}
+
+    diff_pct = (sub["CN_Total_KBD"] - sub["JODI_CN_KBD"]) / sub["JODI_CN_KBD"] * 100.0
+    abs_diff = diff_pct.abs()
+    if np.isclose(sub["CN_Total_KBD"].std(ddof=0), 0.0) or np.isclose(sub["JODI_CN_KBD"].std(ddof=0), 0.0):
+        r_val, p_val = float("nan"), float("nan")
+    else:
+        r_val, p_val = stats.pearsonr(sub["CN_Total_KBD"], sub["JODI_CN_KBD"])
+
+    return {
+        "n": int(n),
+        "pearson_r": float(r_val),
+        "pearson_p": float(p_val),
+        "mape_pct": float(abs_diff.mean()),
+        "mean_diff_pct": float(diff_pct.mean()),
+        "median_abs_diff_pct": float(abs_diff.median()),
+    }
+
+
+def price_discount_regression(
+    zero_df: pd.DataFrame,
+    break_date: str = BREAK_DATE,
+) -> pd.DataFrame:
+    """Ekonomik mekanizma testi: Rusya varil iskontosu ($/bbl) Çin yaptırımlı petrol payını sürüklüyor mu?
+
+    Seviye modeli (HAC): y_t ~ const + iskonto_t + trend + post + post_trend + ay_kukla
+    1. fark modeli (HAC): dy_t ~ const + d_iskonto_t + d_post + post_lag + ay_kukla
+    """
+    if zero_df.empty or "CN_Russia_Discount_USD_bbl" not in zero_df.columns:
+        return pd.DataFrame()
+
+    df = _monthly_index(zero_df).sort_index()
+    bd = pd.Timestamp(break_date)
+    targets = (
+        ("CN_Russia_Share_Pct", "Çin Rusya Payı (%)"),
+        ("CN_Strict_Share_Pct", "Çin Strict Payı (%)"),
+        ("CN_Broad_Share_Pct", "Çin Broad Payı (%)"),
+    )
+
+    rows = []
+    for col, label in targets:
+        if col not in df.columns:
+            continue
+        sub = df[[col, "CN_Russia_Discount_USD_bbl"]].dropna().sort_index()
+        if len(sub) < 18 or (sub.index < bd).sum() < 2 or (sub.index >= bd).sum() < 2:
+            continue
+        if np.isclose(sub["CN_Russia_Discount_USD_bbl"].std(ddof=0), 0.0):
+            continue
+
+        X_base = design_matrix(sub.index, break_date=break_date, seasonal=True)
+        X_lvl = pd.concat([X_base[["const"]], sub[["CN_Russia_Discount_USD_bbl"]].rename(columns={"CN_Russia_Discount_USD_bbl": "spread"}), X_base.drop(columns=["const"])], axis=1)
+        if len(X_lvl) <= X_lvl.shape[1] + 1 or np.linalg.matrix_rank(X_lvl) < X_lvl.shape[1]:
+            continue
+        lags_lvl = newey_west_lags(len(sub))
+        fit_lvl = sm.OLS(sub[col], X_lvl).fit(cov_type="HAC", cov_kwds={"maxlags": lags_lvl})
+
+        dy = sub[col].diff().dropna()
+        d_spread = sub["CN_Russia_Discount_USD_bbl"].diff().reindex(dy.index).rename("d_spread")
+        X_diff_base = diff_design_matrix(sub.index, dy.index, break_date=break_date, seasonal=True)
+        X_diff = pd.concat([X_diff_base[["const"]], d_spread.to_frame(), X_diff_base.drop(columns=["const"])], axis=1).dropna()
+        dy = dy.reindex(X_diff.index)
+        if len(X_diff) <= X_diff.shape[1] + 1 or np.linalg.matrix_rank(X_diff) < X_diff.shape[1]:
+            d_coef = d_se = d_p = d_r2 = float("nan")
+        else:
+            lags_diff = newey_west_lags(len(dy))
+            fit_diff = sm.OLS(dy, X_diff).fit(cov_type="HAC", cov_kwds={"maxlags": lags_diff})
+            d_coef = float(fit_diff.params["d_spread"])
+            d_se = float(fit_diff.bse["d_spread"])
+            d_p = float(fit_diff.pvalues["d_spread"])
+            d_r2 = float(fit_diff.rsquared)
+
+        pre_sp = sub.loc[sub.index < bd, "CN_Russia_Discount_USD_bbl"]
+        post_sp = sub.loc[sub.index >= bd, "CN_Russia_Discount_USD_bbl"]
+        rows.append(
+            {
+                "seri": label,
+                "n_gozlem": int(len(sub)),
+                "ort_iskonto_pre": float(pre_sp.mean()) if not pre_sp.empty else float("nan"),
+                "ort_iskonto_post": float(post_sp.mean()) if not post_sp.empty else float("nan"),
+                "seviye_beta": float(fit_lvl.params["spread"]),
+                "seviye_se": float(fit_lvl.bse["spread"]),
+                "seviye_p": float(fit_lvl.pvalues["spread"]),
+                "seviye_r2": float(fit_lvl.rsquared),
+                "fark_beta": d_coef,
+                "fark_se": d_se,
+                "fark_p": d_p,
+                "fark_r2": d_r2,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def panel_event_study(
+    panel_df: pd.DataFrame,
+    break_date: str = BREAK_DATE,
+    treated_regions: Iterable[str] = ("CN", "IN"),
+    pre_window: int = 12,
+    post_window: int = 24,
+) -> pd.DataFrame:
+    """TWFE Panel Olay Çalışması (Event Study, ref = -1) + Paralel Eğilimler ortak Wald/F testi."""
+    df_p = panel_df.copy()
+    df_p["Date"] = pd.to_datetime(df_p["Date"])
+    if "total_kbd" not in df_p.columns:
+        df_p["total_kbd"] = df_p["petrodollar_kbd"] + df_p["petroyuan_kbd"]
+    if "petroyuan_share_pct" not in df_p.columns:
+        df_p["petroyuan_share_pct"] = np.where(
+            df_p["total_kbd"] > 0, df_p["petroyuan_kbd"] / df_p["total_kbd"] * 100.0, np.nan
+        )
+
+    bd = pd.Timestamp(break_date)
+    treated_set = set(treated_regions)
+    df_p["treated"] = df_p["region"].isin(treated_set).astype(float)
+    df_p["rel_m"] = (df_p["Date"].dt.year - bd.year) * 12 + (df_p["Date"].dt.month - bd.month)
+
+    rows = []
+    for col, label in (
+        ("petroyuan_kbd", "Ülke Petroyuan Hacmi (KBD)"),
+        ("petroyuan_share_pct", "Ülke Petroyuan Payı (%)"),
+    ):
+        sub = df_p.dropna(subset=[col, "region", "Date"]).copy()
+        n_regions = sub["region"].nunique()
+        n_months = sub["Date"].nunique()
+        if n_regions < 2 or n_months < 3 or sub["treated"].nunique() < 2:
+            continue
+
+        rel_binned = sub["rel_m"].clip(lower=-pre_window, upper=post_window).astype(int)
+        avail_k = sorted(int(k) for k in rel_binned.unique())
+        ref_k = -1 if -1 in avail_k else max([k for k in avail_k if k < 0], default=avail_k[0])
+
+        event_cols: Dict[str, pd.Series] = {}
+        for k in avail_k:
+            if k == ref_k:
+                continue
+            ind = (sub["treated"] * (rel_binned == k)).astype(float)
+            if not np.isclose(ind.std(ddof=0), 0.0):
+                event_cols[str(k)] = ind
+        if not event_cols:
+            continue
+
+        D_df = pd.DataFrame(event_cols, index=sub.index)
+        reg_d = pd.get_dummies(sub["region"], prefix="reg", drop_first=True, dtype=float)
+        time_d = pd.get_dummies(sub["Date"].dt.strftime("%Y-%m"), prefix="t", drop_first=True, dtype=float)
+        X_fe = pd.concat([pd.Series(1.0, index=sub.index, name="const"), reg_d, time_d], axis=1)
+
+        X_np = X_fe.to_numpy(dtype=float)
+        y_vec = sub[col].astype(float)
+        M = np.column_stack([y_vec.to_numpy(dtype=float), D_df.to_numpy(dtype=float)])
+        coef_fe, _, rank_fe, _ = np.linalg.lstsq(X_np, M, rcond=None)
+        res_mat = M - X_np @ coef_fe
+
+        y_res = pd.Series(res_mat[:, 0], index=sub.index, name=col)
+        D_res = pd.DataFrame(res_mat[:, 1:], index=sub.index, columns=D_df.columns)
+        keep_cols = [c for c in D_res.columns if not np.isclose(D_res[c].std(ddof=0), 0.0)]
+        if not keep_cols:
+            continue
+        D_res = D_res[keep_cols]
+
+        fwl = sm.OLS(y_res, D_res).fit(cov_type="cluster", cov_kwds={"groups": sub["region"]})
+        n_obs = len(sub)
+        k_fe = int(rank_fe)
+        k_d = D_res.shape[1]
+        dof_adj = (n_obs - k_d) / max(1, n_obs - k_fe - k_d)
+        cov_adj = fwl.cov_params() * dof_adj
+
+        n_treated_post = int(sub.loc[(sub["treated"] > 0) & (sub["rel_m"] >= 0), "region"].nunique())
+        df_clust = max(1, n_regions - 1)
+        crit = float(stats.t.ppf(0.975, df=df_clust))
+
+        pre_cols = [c for c in keep_cols if int(c) < ref_k]
+        if n_treated_post < 2 or not pre_cols:
+            pre_f = pre_p = float("nan")
+        else:
+            V_pre = cov_adj.loc[pre_cols, pre_cols].to_numpy(dtype=float)
+            b_pre = fwl.params.loc[pre_cols].to_numpy(dtype=float)
+            rank_v = int(np.linalg.matrix_rank(V_pre))
+            if rank_v > 0:
+                wald = float(b_pre.T @ np.linalg.pinv(V_pre, rcond=1e-10) @ b_pre)
+                pre_f = wald / rank_v
+                pre_p = float(stats.f.sf(pre_f, rank_v, df_clust))
+            else:
+                pre_f = pre_p = float("nan")
+
+        if n_treated_post < 2:
+            log.warning(
+                "Panel Event-Study (%s): kırılma sonrası verisi olan yalnızca %d treated bölge var; "
+                "kümeli SE güvenilmez olduğu için NaN bırakıldı.",
+                label,
+                n_treated_post,
+            )
+
+        sub_rows = [
+            {
+                "bagimli_degisken": label,
+                "rel_month": int(ref_k),
+                "event_date": (bd + pd.DateOffset(months=int(ref_k))).strftime("%Y-%m"),
+                "coef": 0.0,
+                "se": 0.0,
+                "ci_low": 0.0,
+                "ci_high": 0.0,
+                "t_ist": float("nan"),
+                "p_degeri": float("nan"),
+                "is_ref": True,
+                "pretrend_f": pre_f,
+                "pretrend_p": pre_p,
+                "n_gozlem": int(n_obs),
+                "n_ulke": int(n_regions),
+            }
+        ]
+        for c in keep_cols:
+            k = int(c)
+            coef = float(fwl.params[c])
+            if n_treated_post < 2:
+                se = ci_l = ci_h = t_s = p_v = float("nan")
+            else:
+                se = float(np.sqrt(max(0.0, float(cov_adj.loc[c, c]))))
+                ci_l = coef - crit * se
+                ci_h = coef + crit * se
+                t_s = coef / se if se > 0 else float("nan")
+                p_v = float(2.0 * stats.t.sf(abs(t_s), df=df_clust)) if np.isfinite(t_s) else float("nan")
+            sub_rows.append(
+                {
+                    "bagimli_degisken": label,
+                    "rel_month": k,
+                    "event_date": (bd + pd.DateOffset(months=k)).strftime("%Y-%m"),
+                    "coef": coef,
+                    "se": se,
+                    "ci_low": ci_l,
+                    "ci_high": ci_h,
+                    "t_ist": t_s,
+                    "p_degeri": p_v,
+                    "is_ref": False,
+                    "pretrend_f": pre_f,
+                    "pretrend_p": pre_p,
+                    "n_gozlem": int(n_obs),
+                    "n_ulke": int(n_regions),
+                }
+            )
+        rows.extend(sorted(sub_rows, key=lambda r: r["rel_month"]))
+    return pd.DataFrame(rows)
+
+
+def run_zero_tests(
+    zero_df: Optional[pd.DataFrame] = None,
+    break_date: str = BREAK_DATE,
+    targets: Dict[str, str] = ZERO_TARGETS,
+) -> Tuple[pd.DataFrame, Dict[str, float], pd.DataFrame, List[str]]:
+    """Sıfır varsayımlı (pure customs/EPDK/JODI) seriler, GACC-JODI doğrulaması ve fiyat iskontosu analizini çalıştırır."""
+    if zero_df is None:
+        z_path = FILES["zero_global"]
+        if not z_path.exists():
+            return pd.DataFrame(), {}, pd.DataFrame(), []
+        df = pd.read_csv(z_path, index_col=0, parse_dates=True).sort_index().loc[START_DATE:END_DATE]
+    else:
+        df = zero_df.copy().sort_index().loc[START_DATE:END_DATE]
+
+    if df.empty:
+        return pd.DataFrame(), {}, pd.DataFrame(), []
+    df = df.asfreq("MS")
+
+    summaries, report = [], []
+    for col, name in targets.items():
+        if col not in df.columns or df[col].dropna().empty:
+            continue
+        s, lines = analyze(df[col], name, break_date=break_date)
+        summaries.append(asdict(s))
+        report.extend(lines)
+
+    xval = cross_validate_gacc_jodi(df)
+    if xval.get("n", 0) >= 2:
+        report.extend(
+            [
+                "=" * 82,
+                " GACC vs JODI Çin Toplam İthalatı Çapraz Doğrulaması",
+                "=" * 82,
+                f"Örtüşen ay: {xval['n']} | Pearson r = {xval['pearson_r']:.4f} (p={xval['pearson_p']:.4g}) | "
+                f"MAPE = %{xval['mape_pct']:.2f} | Ort. fark = %{xval['mean_diff_pct']:+.2f} | "
+                f"Medyan |fark| = %{xval['median_abs_diff_pct']:.2f}",
+                "",
+            ]
+        )
+
+    disc_df = price_discount_regression(df, break_date=break_date)
+    if not disc_df.empty:
+        report.extend(
+            [
+                "=" * 82,
+                " Fiyat Mekanizması: Rusya Gümrük İskontosu ($/varil) -> Çin Yaptırımlı Payı (%)",
+                "=" * 82,
+                disc_df.to_string(index=False, float_format=lambda v: f"{v:.4f}"),
+                "",
+            ]
+        )
+
+    summary_df = pd.DataFrame(summaries)
+    if zero_df is None:
+        OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+        if not summary_df.empty:
+            summary_df.to_csv(OUTPUTS_DIR / "econometrics_zero_assumption_summary.csv", index=False)
+        if not disc_df.empty:
+            disc_df.to_csv(OUTPUTS_DIR / "econometrics_discount_mechanism.csv", index=False)
+        if report:
+            (OUTPUTS_DIR / "econometrics_zero_assumption_report.txt").write_text("\n".join(report), encoding="utf-8")
+            log.info("Sıfır varsayım ekonometri raporu kaydedildi: outputs/econometrics_zero_assumption_report.txt")
+    return summary_df, xval, disc_df, report
+
+
 def run_tests(targets: Dict[str, str] = TARGETS) -> bool:
     path = FILES["global"]
     if not path.exists():
@@ -576,13 +997,21 @@ def run_tests(targets: Dict[str, str] = TARGETS) -> bool:
         summaries.append(asdict(s))
         report.extend(lines)
 
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
     sens_df = sensitivity_robustness(df)
+    if FILES["china_payment"].exists() and FILES["india"].exists():
+        cn_pay = pd.read_csv(FILES["china_payment"], index_col=0, parse_dates=True)
+        in_df = pd.read_csv(FILES["india"], index_col=0, parse_dates=True)
+        const_df = constant_share_robustness(df, cn_pay, in_df)
+        if not const_df.empty:
+            sens_df = pd.concat([sens_df, const_df], ignore_index=True)
+
     if not sens_df.empty:
         sens_df.to_csv(OUTPUTS_DIR / "econometrics_sensitivity.csv", index=False)
         report.extend(
             [
                 "=" * 82,
-                " 7) Varsayım Duyarlılık Bandı Sağlamlık Kontrolü (±%5)",
+                " 7) Varsayım Duyarlılık Bandı (±%5) & Sabit-Oran / Strict Sağlamlık Kontrolü",
                 "=" * 82,
                 sens_df.to_string(index=False, float_format=lambda v: f"{v:.3f}"),
                 "",
@@ -603,11 +1032,30 @@ def run_tests(targets: Dict[str, str] = TARGETS) -> bool:
                     "",
                 ]
             )
+        es_df = panel_event_study(panel_raw)
+        if not es_df.empty:
+            es_df.to_csv(OUTPUTS_DIR / "econometrics_panel_event_study.csv", index=False)
+            es_lines = [
+                "=" * 82,
+                " 9) Panel Olay Çalışması (Event Study, ref=-1) & Paralel Eğilimler Testi",
+                "=" * 82,
+            ]
+            for dep, grp in es_df.groupby("bagimli_degisken", sort=False):
+                f_pre = grp["pretrend_f"].iloc[0]
+                p_pre = grp["pretrend_p"].iloc[0]
+                key_t = grp[grp["rel_month"].isin([-12, -6, 0, 6, 12, 24])]
+                snap = ", ".join(f"t={int(r.rel_month):+d}:{r.coef:.2f}" for r in key_t.itertuples())
+                es_lines.append(f"{dep}: Pre-trend F={f_pre:.3f} (p={p_pre:.4g}) | Özet: {snap}")
+            es_lines.append("")
+            report.extend(es_lines)
 
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
     (OUTPUTS_DIR / "econometrics_report.txt").write_text("\n".join(report), encoding="utf-8")
     pd.DataFrame(summaries).to_csv(OUTPUTS_DIR / "econometrics_summary.csv", index=False)
-    print("\n".join(report))
+
+    _, _, _, zero_lines = run_zero_tests()
+    full_print = report + ([""] + zero_lines if zero_lines else [])
+    print("\n".join(full_print))
     log.info("Ekonometri raporu kaydedildi: outputs/econometrics_report.txt")
     return True
 
