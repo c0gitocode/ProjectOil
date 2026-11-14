@@ -176,6 +176,40 @@ def test_epdk_month_detection_table_and_links(tmp_path, monkeypatch):
         epdk._process_report(2024, 11, "https://example.com/bad")
 
 
+def test_epdk_find_report_links_html_variants():
+    assert epdk.detect_report_month("2024 Yılı Kasım Ayı Raporu (Revize: Ocak 2025)") == (2024, 11)
+    assert epdk.detect_report_month("2024 Yılı Ocak - Şubat Ayı Raporu") is None
+
+    html = """
+    <div class="accordion">
+      <p>2023 Yılı Haziran Ayı Petrol Piyasası Sektör Raporu
+         <strong><a href="/Detay/DownloadDocument?id=201"><i class="fa fa-file-pdf"></i></a></strong>
+      </p>
+      <p>2023 Yılı Temmuz Ayı Petrol Piyasası Sektör Raporu
+         <a href="/Detay/DownloadDocument?id=202"><img alt="PDF" src="/img/doc.png"/></a>
+         <a href="/Detay/DownloadDocument?id=203"><img alt="Excel" src="/img/xls.png"/></a>
+      </p>
+      <div>
+        2023 Yılı Ağustos Ayı Petrol Piyasası Sektör Raporu <a href="/Detay/DownloadDocument?id=204">PDF</a><br/>
+        2023 Yılı Eylül Ayı Petrol Piyasası Sektör Raporu <a href="/Detay/DownloadDocument?id=205">PDF</a>
+      </div>
+      <table>
+        <tr>
+          <td>2023 Yılı Ekim Ayı İl Bazında Bayi Satış Raporu</td>
+          <td><a href="/Detay/DownloadDocument?id=206">2023 Ekim</a></td>
+        </tr>
+      </table>
+    </div>
+    """
+    links = epdk.find_report_links(html, 2020)
+    assert links == {
+        (2023, 6): "https://www.epdk.gov.tr/Detay/DownloadDocument?id=201",
+        (2023, 7): "https://www.epdk.gov.tr/Detay/DownloadDocument?id=202",
+        (2023, 8): "https://www.epdk.gov.tr/Detay/DownloadDocument?id=204",
+        (2023, 9): "https://www.epdk.gov.tr/Detay/DownloadDocument?id=205",
+    }
+
+
 # ---------------------------------------------------------
 # DGCIS ve GACC testleri
 # ---------------------------------------------------------
@@ -184,6 +218,84 @@ def test_dgcis_target_periods_completed_month(monkeypatch):
     periods = dgcis.target_periods(now=pd.Timestamp("2026-11-14"))
     assert periods[0] == "Apr-2021"
     assert periods[-1] == "Oct-2026"
+
+
+def test_dgcis_wait_select_helpers(monkeypatch):
+    import sys
+
+    class FakeOpt:
+        def __init__(self, value, text):
+            self._v = value
+            self.text = text
+
+        def get_attribute(self, name):
+            return self._v if name == "value" else None
+
+    class FakeSelect:
+        def __init__(self, el):
+            self.el = el
+            self.options = el.current_options()
+
+        def select_by_index(self, idx):
+            if idx >= len(self.options):
+                raise RuntimeError("NoSuchElement")
+            self.el.selected = self.options[idx].get_attribute("value")
+
+        def select_by_value(self, val):
+            if not any(o.get_attribute("value") == val for o in self.options):
+                raise RuntimeError("NoSuchElement")
+            self.el.selected = val
+
+    class FakeEl:
+        def __init__(self, snapshots):
+            self.snapshots = snapshots
+            self.calls = 0
+            self.selected = None
+
+        def current_options(self):
+            idx = min(self.calls, len(self.snapshots) - 1)
+            self.calls += 1
+            return self.snapshots[idx]
+
+    sorted_el = FakeEl(
+        [
+            [FakeOpt("", "SELECT"), FakeOpt("{{item.COMBO_CODE}}", "{{item.COMBO_DESC}}")],
+            [FakeOpt("", "SELECT"), FakeOpt("1", "QTY WISE")],
+        ]
+    )
+    comm_el = FakeEl([[FakeOpt("", "SELECT")], [FakeOpt("S5", "CRUDE OIL")]])
+
+    class FakeDriver:
+        def find_element(self, by, sid):
+            return sorted_el if sid == "sorted" else comm_el
+
+        def execute_script(self, script, el):
+            pass
+
+    class FakeWait:
+        def __init__(self, drv):
+            self.drv = drv
+
+        def until(self, cond):
+            for _ in range(5):
+                if cond(self.drv):
+                    return True
+            raise AssertionError("condition never satisfied")
+
+    monkeypatch.setitem(sys.modules, "selenium.webdriver.common.by", SimpleNamespace(By=SimpleNamespace(ID="id")))
+    monkeypatch.setitem(
+        sys.modules,
+        "selenium.common.exceptions",
+        SimpleNamespace(StaleElementReferenceException=RuntimeError),
+    )
+    monkeypatch.setitem(sys.modules, "selenium.webdriver.support.ui", SimpleNamespace(Select=FakeSelect))
+
+    drv = FakeDriver()
+    wait = FakeWait(drv)
+    dgcis._wait_select_index(drv, wait, "sorted", 1)
+    dgcis._wait_select_value(drv, wait, "comm", "S5")
+    assert sorted_el.selected == "1"
+    assert comm_el.selected == "S5"
 
 
 def test_gacc_months_and_missing_years(tmp_path, monkeypatch):

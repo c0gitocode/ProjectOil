@@ -19,18 +19,28 @@ MONTHS_TR = {
     "ocak": 1, "şubat": 2, "mart": 3, "nisan": 4, "mayıs": 5, "haziran": 6,
     "temmuz": 7, "ağustos": 8, "eylül": 9, "ekim": 10, "kasım": 11, "aralık": 12,
 }
-_MONTH_RE = re.compile(r"(?<![a-zçğıöşü])(" + "|".join(MONTHS_TR) + r")(?![a-zçğıöşü])")
+_MONTH_PATTERN = "|".join(MONTHS_TR)
+_MONTH_RE = re.compile(rf"(?<![a-zçğıöşü])({_MONTH_PATTERN})(?![a-zçğıöşü])")
+_MONTH_RANGE_RE = re.compile(rf"(?<![a-zçğıöşü])(?:{_MONTH_PATTERN})\s*[-–/]\s*(?:{_MONTH_PATTERN})(?![a-zçğıöşü])")
+_PRIMARY_YM_RE = re.compile(rf"(?<!\d)(20[1-3]\d)\s*yılı\s*({_MONTH_PATTERN})\s*ayı(?![a-zçğıöşü])")
 _YEAR_RE = re.compile(r"(?<!\d)(20[1-3]\d)(?!\d)")
 
 
 def detect_report_month(text: str) -> Optional[Tuple[int, int]]:
-    """Link metninden (yıl, ay) çıkarır. Belirsizse (birden fazla ay/yıl) None döner."""
+    """Link metninden (yıl, ay) çıkarır. Aralık/çoklu ay metinlerinde None döner."""
     t = tr_lower(text)
+    if _MONTH_RANGE_RE.search(t):
+        return None
     months = set(_MONTH_RE.findall(t))
     years = set(_YEAR_RE.findall(t))
-    if len(months) != 1 or len(years) != 1:
-        return None
-    return int(years.pop()), MONTHS_TR[months.pop()]
+    if len(months) == 1 and len(years) == 1:
+        return int(years.pop()), MONTHS_TR[months.pop()]
+    # Başlık "2024 Yılı Kasım Ayı Raporu (Revize: Ocak 2025)" gibiyse ve çoklu dönem değilse ana tarihi al.
+    if len(t) < 250 and len(months) <= 2 and len(years) <= 2:
+        m = _PRIMARY_YM_RE.search(t)
+        if m:
+            return int(m.group(1)), MONTHS_TR[m.group(2)]
+    return None
 
 
 def parse_import_table(table: List[List[Optional[str]]]) -> Optional[Tuple[float, float]]:
@@ -120,52 +130,138 @@ def _process_report(year: int, month: int, link: str) -> Optional[Dict]:
     }
 
 
-def find_report_links(html: str, start_year: int) -> Dict[Tuple[int, int], str]:
+_NON_PDF_HINTS = ("excel", ".xlsx", ".xls", "xlsx", "xls", ".csv", ".zip", ".docx", ".doc")
+
+
+def _link_meta_text(a) -> str:
+    parts = [a.get("href") or "", a.get_text(" ", strip=True), a.get("title") or "", a.get("aria-label") or ""]
+    parts.extend(a.get("class") or [])
+    for tag in a.find_all(["img", "i", "span", "svg"]):
+        parts.extend(
+            [
+                tag.get("src") or "",
+                tag.get("alt") or "",
+                tag.get("title") or "",
+                " ".join(tag.get("class") or []),
+            ]
+        )
+    return tr_lower(" ".join(str(p) for p in parts if p))
+
+
+def _link_candidates(a) -> List[str]:
+    candidates: List[str] = []
+    seen = set()
+
+    def _add(txt: Optional[str]) -> None:
+        clean = " ".join((txt or "").split())
+        if clean and clean not in seen:
+            seen.add(clean)
+            candidates.append(clean)
+
+    _add(a.get_text(" ", strip=True))
+    _add(a.get("title"))
+
+    # Aynı satır/paragraf içinde <br> ile ayrılmış linklerde önceki metni yakala (başka <a> görünce dur).
+    sib_chunks: List[str] = []
+    for sib in a.previous_siblings:
+        name = getattr(sib, "name", None)
+        if name in ("a", "br", "hr", "p", "tr", "li", "div"):
+            break
+        txt = sib.get_text(" ", strip=True) if hasattr(sib, "get_text") else str(sib).strip()
+        if txt:
+            sib_chunks.append(txt)
+        if len(sib_chunks) >= 3:
+            break
+    if sib_chunks:
+        _add(" ".join(reversed(sib_chunks)) + " " + (a.get_text(" ", strip=True) or ""))
+
+    for parent in a.parents:
+        if parent.name in ("[document]", "html", "body", "table", "tbody"):
+            break
+        if parent.name == "div" and len(parent.find_all("a", href=True)) > 2:
+            break
+        if parent.name in ("span", "strong", "b", "td", "p", "li", "tr", "div"):
+            txt = parent.get_text(" ", strip=True)
+            if len(txt) <= 1000:
+                _add(txt)
+            if parent.name in ("tr", "li", "p"):
+                break
+    return candidates
+
+
+def _collect_report_links(html: str, start_year: int) -> Tuple[Dict[Tuple[int, int], str], Dict[str, object]]:
     soup = BeautifulSoup(html, "html.parser")
     links: Dict[Tuple[int, int], str] = {}
+    stats: Dict[str, object] = {
+        "doc_links": 0,
+        "skipped_il_bazinda": 0,
+        "skipped_non_pdf": 0,
+        "skipped_no_date": 0,
+        "skipped_old": 0,
+        "samples": [],
+    }
+
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if "DownloadDocument" not in href:
+        href_low = href.lower()
+        if "downloaddocument" not in href_low and not href_low.endswith(".pdf"):
             continue
+        stats["doc_links"] = int(stats["doc_links"]) + 1
 
-        candidates = [a.get_text(" ", strip=True)]
-        parent = a.find_parent()
-        if parent:
-            candidates.append(parent.get_text(" ", strip=True))
-        row_container = a.find_parent(["tr", "li", "div"])
-        if row_container and row_container is not parent:
-            candidates.append(row_container.get_text(" ", strip=True))
-
+        candidates = _link_candidates(a)
         matched_text = None
         ym = None
         for cand in candidates:
-            if not cand:
-                continue
             cand_ym = detect_report_month(cand)
             if cand_ym is not None:
                 ym = cand_ym
                 matched_text = cand
                 break
 
-        context_text = matched_text or (candidates[1] if len(candidates) > 1 else candidates[0])
+        context_text = matched_text or (candidates[-1] if candidates else "")
         low = tr_lower(context_text)
-        if "il bazında" in low or "bayi" in low:
+        # Sadece tek satırlı kapsayıcılarda ("tr", "li", "p") tüm adaylara bak; div satırları paylaşabilir.
+        row_only = a.find_parent(["tr", "li", "p"])
+        excl_text = tr_lower(row_only.get_text(" ", strip=True)) if row_only is not None else low
+        if "il bazında" in excl_text or "bayi" in excl_text:
+            stats["skipped_il_bazinda"] = int(stats["skipped_il_bazinda"]) + 1
             continue
 
-        img = a.find("img")
+        meta = _link_meta_text(a)
+        is_non_pdf = any(h in meta for h in _NON_PDF_HINTS) and "pdf" not in meta
+        if is_non_pdf:
+            stats["skipped_non_pdf"] = int(stats["skipped_non_pdf"]) + 1
+            continue
+
         is_pdf = (
-            (img is not None and "pdf" in (img.get("src") or "").lower())
-            or "pdf" in tr_lower(" ".join(candidates[:2]))
-            or href.lower().endswith(".pdf")
+            "pdf" in meta
+            or href_low.endswith(".pdf")
+            or ("pdf" in tr_lower(" ".join(candidates)))
+            or ("rapor" in low and a.find("img") is None and ym is not None)
         )
         if not is_pdf:
+            stats["skipped_non_pdf"] = int(stats["skipped_non_pdf"]) + 1
+            if len(stats["samples"]) < 5:  # type: ignore[arg-type]
+                stats["samples"].append(f"non_pdf: {context_text[:70]} [{href[:40]}]")  # type: ignore[attr-defined]
             continue
 
         if ym is None:
+            stats["skipped_no_date"] = int(stats["skipped_no_date"]) + 1
             log.debug("EPDK link atlandı (ay/yıl belirsiz): %s", context_text[:80])
+            if len(stats["samples"]) < 5:  # type: ignore[arg-type]
+                stats["samples"].append(f"no_date: {context_text[:70]} [{href[:40]}]")  # type: ignore[attr-defined]
             continue
-        if ym[0] >= start_year:
-            links.setdefault(ym, "https://www.epdk.gov.tr" + href if href.startswith("/") else href)
+
+        if ym[0] < start_year:
+            stats["skipped_old"] = int(stats["skipped_old"]) + 1
+            continue
+
+        links.setdefault(ym, "https://www.epdk.gov.tr" + href if href.startswith("/") else href)
+    return links, stats
+
+
+def find_report_links(html: str, start_year: int) -> Dict[Tuple[int, int], str]:
+    links, _ = _collect_report_links(html, start_year)
     return links
 
 
@@ -189,9 +285,22 @@ def update(max_workers: int = 3) -> None:
     with c_requests.Session(impersonate="chrome") as s:
         res = s.get(EPDK_PAGE, timeout=30)
         res.raise_for_status()
-    links = find_report_links(res.text, pd.Timestamp(START_DATE).year)
+    start_year = pd.Timestamp(START_DATE).year
+    links, link_stats = _collect_report_links(res.text, start_year)
     todo = {ym: l for ym, l in links.items() if f"{ym[0]}-{ym[1]:02d}-01" not in done}
     log.info("EPDK: %d rapor linki bulundu, %d yeni.", len(links), len(todo))
+    if len(links) < 24 and pd.Timestamp.now().year - start_year >= 2:
+        log.warning(
+            "EPDK beklenenden az rapor linki (%d); istatistikler -> toplam_doc=%s, il_bazinda=%s, "
+            "pdf_degil=%s, tarih_yok=%s, eski=%s | örnek=%s",
+            len(links),
+            link_stats["doc_links"],
+            link_stats["skipped_il_bazinda"],
+            link_stats["skipped_non_pdf"],
+            link_stats["skipped_no_date"],
+            link_stats["skipped_old"],
+            link_stats["samples"],
+        )
     if not todo:
         return
 

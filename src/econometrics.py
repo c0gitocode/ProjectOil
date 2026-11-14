@@ -283,6 +283,12 @@ class Summary:
     kpss_diff_p: float
 
 
+def _can_fit_its(X: pd.DataFrame, key_cols: Tuple[str, ...]) -> bool:
+    if len(X) <= X.shape[1] + 1:
+        return False
+    return all(c in X.columns and not np.isclose(X[c].std(ddof=0), 0.0) for c in key_cols)
+
+
 def analyze(y: pd.Series, name: str, break_date: str = BREAK_DATE) -> Tuple[Summary, List[str]]:
     y = y.dropna().sort_index()
     bd = pd.Timestamp(break_date)
@@ -290,10 +296,31 @@ def analyze(y: pd.Series, name: str, break_date: str = BREAK_DATE) -> Tuple[Summ
 
     ur = unit_root_tests(y)
     X_level = design_matrix(y.index, break_date, seasonal=True)
-    model, lags = its_regression(y, break_date, seasonal=True)
-    diag = residual_diagnostics(y, X_level, bg_lags=lags)
+    if len(pre) >= 2 and len(post) >= 2 and _can_fit_its(X_level, ("post", "post_trend")):
+        model, lags = its_regression(y, break_date, seasonal=True)
+        diag = residual_diagnostics(y, X_level, bg_lags=lags)
+        its_level_shift = float(model.params["post"])
+        its_level_p = float(model.pvalues["post"])
+        its_slope_change = float(model.params["post_trend"])
+        its_slope_p = float(model.pvalues["post_trend"])
+        its_r2 = float(model.rsquared)
+    else:
+        log.warning("%s: Seviye ITS için yetersiz örneklem (öncesi=%d, sonrası=%d, X_k=%d).", name, len(pre), len(post), X_level.shape[1])
+        lags = 0
+        diag = {"dw_stat": float("nan"), "bg_lags": 0, "bg_stat": float("nan"), "bg_p": float("nan"), "bp_stat": float("nan"), "bp_p": float("nan")}
+        its_level_shift = its_level_p = its_slope_change = its_slope_p = its_r2 = float("nan")
 
-    diff_model, diff_lags = its_diff_regression(y, break_date, seasonal=True)
+    dy = y.diff().dropna()
+    X_diff = diff_design_matrix(y.index, dy.index, break_date, seasonal=True) if not dy.empty else pd.DataFrame()
+    if len(pre) >= 2 and len(post) >= 2 and not X_diff.empty and _can_fit_its(X_diff, ("d_post", "post_lag")):
+        diff_model, diff_lags = its_diff_regression(y, break_date, seasonal=True)
+        diff_level_shift = float(diff_model.params["d_post"])
+        diff_level_p = float(diff_model.pvalues["d_post"])
+        diff_slope_change = float(diff_model.params["post_lag"])
+        diff_slope_p = float(diff_model.pvalues["post_lag"])
+    else:
+        diff_lags = 0
+        diff_level_shift = diff_level_p = diff_slope_change = diff_slope_p = float("nan")
 
     X_base = sm.add_constant(pd.Series(_calendar_trend(y.index), index=y.index, name="trend"))
     chow_f, chow_p = chow_test(y, X_base, len(pre))
@@ -302,24 +329,30 @@ def analyze(y: pd.Series, name: str, break_date: str = BREAK_DATE) -> Tuple[Summ
     qa_date, qa_f, qa_w, _ = quandt_andrews(y)
     qa_sig = andrews_significance(qa_w)
 
-    t_stat, t_p = stats.ttest_ind(pre, post, equal_var=False)
-    u_stat, u_p = stats.mannwhitneyu(pre, post, alternative="two-sided")
+    if len(pre) >= 2 and len(post) >= 2:
+        t_stat, t_p = stats.ttest_ind(pre, post, equal_var=False)
+        u_stat, u_p = stats.mannwhitneyu(pre, post, alternative="two-sided")
+    else:
+        t_stat = t_p = u_stat = u_p = float("nan")
+
+    mean_pre = float(pre.mean()) if not pre.empty else float("nan")
+    mean_post = float(post.mean()) if not post.empty else float("nan")
 
     s = Summary(
         seri=name,
         n_pre=len(pre),
         n_post=len(post),
-        mean_pre=float(pre.mean()),
-        mean_post=float(post.mean()),
-        its_level_shift=float(model.params["post"]),
-        its_level_p=float(model.pvalues["post"]),
-        its_slope_change=float(model.params["post_trend"]),
-        its_slope_p=float(model.pvalues["post_trend"]),
-        its_r2=float(model.rsquared),
-        diff_level_shift=float(diff_model.params["d_post"]),
-        diff_level_p=float(diff_model.pvalues["d_post"]),
-        diff_slope_change=float(diff_model.params["post_lag"]),
-        diff_slope_p=float(diff_model.pvalues["post_lag"]),
+        mean_pre=mean_pre,
+        mean_post=mean_post,
+        its_level_shift=its_level_shift,
+        its_level_p=its_level_p,
+        its_slope_change=its_slope_change,
+        its_slope_p=its_slope_p,
+        its_r2=its_r2,
+        diff_level_shift=diff_level_shift,
+        diff_level_p=diff_level_p,
+        diff_slope_change=diff_slope_change,
+        diff_slope_p=diff_slope_p,
         hac_lags=lags,
         dw_stat=diag["dw_stat"],
         bg_p=diag["bg_p"],
@@ -344,7 +377,7 @@ def analyze(y: pd.Series, name: str, break_date: str = BREAK_DATE) -> Tuple[Summ
         f" {name}",
         "=" * 82,
         f"Örneklem: {y.index.min():%Y-%m} – {y.index.max():%Y-%m} | Öncesi {len(pre)} ay, sonrası {len(post)} ay",
-        f"Ortalama: öncesi {pre.mean():.2f} | sonrası {post.mean():.2f}",
+        f"Ortalama: öncesi {mean_pre:.2f} | sonrası {mean_post:.2f}",
         "",
         "1) Birim kök & durağanlık testleri (seviye='ct', 1. fark='c')",
         ur.to_string(index=False, float_format=lambda v: f"{v:.4f}"),
@@ -411,10 +444,11 @@ def sensitivity_robustness(df: pd.DataFrame, break_date: str = BREAK_DATE) -> pd
             ]
         )
 
+    bd = pd.Timestamp(break_date)
     rows = []
     for target_name, scen_name, series in scenarios:
         s = series.dropna()
-        if len(s) < 16:
+        if len(s) < 18 or (s.index < bd).sum() < 2 or (s.index >= bd).sum() < 2:
             continue
         lvl, _ = its_regression(s, break_date, seasonal=True)
         diff, _ = its_diff_regression(s, break_date, seasonal=True)
@@ -485,13 +519,23 @@ def panel_fe_did(
         fwl = sm.OLS(y_res, x_res.to_frame("treated_post")).fit(
             cov_type="cluster", cov_kwds={"groups": sub["region"]}
         )
+        n_treated_post = int(sub.loc[sub["treated_post"] > 0, "region"].nunique())
         n_obs = len(sub)
         k_full = int(np.linalg.matrix_rank(X_fe)) + 1
         dof_scale = float(np.sqrt((n_obs - 1) / max(1, n_obs - k_full)))
-        se_cluster = float(fwl.bse["treated_post"] * dof_scale)
         coef = float(fwl.params["treated_post"])
-        t_stat = float(coef / se_cluster) if se_cluster > 0 else float("nan")
-        p_val = float(2.0 * stats.t.sf(abs(t_stat), df=n_regions - 1)) if np.isfinite(t_stat) else float("nan")
+        if n_treated_post < 2:
+            log.warning(
+                "Panel DiD (%s): kırılma sonrası verisi olan yalnızca %d treated bölge var; "
+                "tek treated kümede bölge-kümeli SE güvenilmez olduğu için NaN bırakıldı.",
+                label,
+                n_treated_post,
+            )
+            se_cluster = t_stat = p_val = float("nan")
+        else:
+            se_cluster = float(fwl.bse["treated_post"] * dof_scale)
+            t_stat = float(coef / se_cluster) if se_cluster > 0 else float("nan")
+            p_val = float(2.0 * stats.t.sf(abs(t_stat), df=n_regions - 1)) if np.isfinite(t_stat) else float("nan")
         overall_r2 = float(sm.OLS(y_vec, pd.concat([sub[["treated_post"]], X_fe], axis=1)).fit().rsquared)
 
         rows.append(
