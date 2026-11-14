@@ -270,6 +270,37 @@ def test_epdk_real_2025_titles_and_candidate_fallback(tmp_path, monkeypatch):
     assert res["TR_Toplam_Ithalat_Ton"] == pytest.approx(1_000_000.0)
 
 
+def test_epdk_sibling_il_bazinda_annex_does_not_drop_main_report():
+    # Canlı EPDK HTML'inde 2024 Kasım ve Aralık ana rapor linkleri aynı <p>/<tr> içinde
+    # "Eki - İl Bazında Teslimler" linkiyle kardeş olarak durduğunda ana rapor korunmalı, ek atlanmalıdır.
+    html = """
+    <div>
+      <p>
+        <a href="/Detay/DownloadDocument?id=LFSK+oClrtg=">2024_Kasım_Petrol Piyasası Sektör Raporu</a>
+        <a href="/Detay/DownloadDocument?id=rEzZvUfJKNU=">Petrol Piyasası Sektör Raporu Eki - İl Bazında Teslimler Kasım 2024</a>
+      </p>
+      <table>
+        <tr>
+          <td>
+            <a href="/Detay/DownloadDocument?id=4R1jVrGAsKc=">2024 Yılı Petrol Piyasası Aralık Ayı Sektör Raporu</a><br/>
+            <a href="/Detay/DownloadDocument?id=annex_dec">Petrol Piyasası Sektör Raporu Eki - İl Bazında Teslimler Aralık 2024</a>
+          </td>
+        </tr>
+        <tr>
+          <td>2024 Yılı Ekim Ayı İl Bazında Bayi Satış Raporu</td>
+          <td><a href="/Detay/DownloadDocument?id=bayi_oct">PDF İndir</a></td>
+        </tr>
+      </table>
+    </div>
+    """
+    links, stats = epdk._collect_report_links(html, 2020)
+    assert links == {
+        (2024, 11): "https://www.epdk.gov.tr/Detay/DownloadDocument?id=LFSK+oClrtg=",
+        (2024, 12): "https://www.epdk.gov.tr/Detay/DownloadDocument?id=4R1jVrGAsKc=",
+    }
+    assert stats["skipped_il_bazinda"] == 3
+
+
 def _make_minimal_docx_bytes() -> bytes:
     import zipfile
 

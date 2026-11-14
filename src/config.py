@@ -56,6 +56,7 @@ FILES = {
     "china_payment": PROCESSED_DIR / "china_petrodolar_petroyuan_kbd.csv",
     "india": PROCESSED_DIR / "hindistan_nihai_hacim_analizi_kbd.csv",
     "global": PROCESSED_DIR / "GLOBAL_PETRODOLAR_VS_PETROYUAN.csv",
+    "zero_global": PROCESSED_DIR / "GLOBAL_ZERO_ASSUMPTION.csv",
     "panel": PROCESSED_DIR / "panel_long.csv",
 }
 

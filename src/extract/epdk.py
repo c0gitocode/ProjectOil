@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import pandas as pd
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment, NavigableString
 
 from ..config import FILES, RAW_DIR, START_DATE
 from ..logger import get_logger
@@ -495,6 +495,22 @@ def _link_meta_text(a) -> str:
     return tr_lower(" ".join(str(p) for p in parts if p))
 
 
+def _row_non_sibling_anchor_text(container, anchor) -> str:
+    """Kapsayıcıdaki diğer kardeş <a> linklerinin metnini dışlayarak metin toplar."""
+    parts: List[str] = []
+    for node in container.descendants:
+        if not isinstance(node, NavigableString) or isinstance(node, Comment):
+            continue
+        if getattr(node.parent, "name", None) in ("script", "style"):
+            continue
+        parent_a = node.find_parent("a")
+        if parent_a is None or parent_a is anchor:
+            txt = " ".join(str(node).split())
+            if txt:
+                parts.append(txt)
+    return " ".join(parts)
+
+
 def _link_candidates(a) -> List[str]:
     candidates: List[str] = []
     seen = set()
@@ -528,6 +544,8 @@ def _link_candidates(a) -> List[str]:
         if parent.name == "div" and len(parent.find_all("a", href=True)) > 2:
             break
         if parent.name in ("span", "strong", "b", "td", "p", "li", "tr", "div"):
+            if len(parent.find_all("a", href=True)) > 1:
+                _add(_row_non_sibling_anchor_text(parent, a))
             txt = parent.get_text(" ", strip=True)
             if len(txt) <= 1000:
                 _add(txt)
@@ -568,10 +586,16 @@ def _collect_report_links(html: str, start_year: int) -> Tuple[Dict[Tuple[int, i
 
         context_text = matched_text or (candidates[-1] if candidates else "")
         low = tr_lower(context_text)
-        # Sadece tek satırlı kapsayıcılarda ("tr", "li", "p") tüm adaylara bak; div satırları paylaşabilir.
+        own_low = tr_lower(" ".join(p for p in (a.get_text(" ", strip=True), a.get("title") or "") if p))
+        # Sadece tek satırlı kapsayıcılarda ("tr", "li", "p") kardeş <a> linkleri dışındaki metne bak.
         row_only = a.find_parent(["tr", "li", "p"])
-        excl_text = tr_lower(row_only.get_text(" ", strip=True)) if row_only is not None else low
-        if "il bazında" in excl_text or "bayi" in excl_text:
+        excl_text = tr_lower(_row_non_sibling_anchor_text(row_only, a)) if row_only is not None else low
+        if (
+            "il bazında" in own_low
+            or "bayi" in own_low
+            or "il bazında" in excl_text
+            or "bayi" in excl_text
+        ):
             stats["skipped_il_bazinda"] = int(stats["skipped_il_bazinda"]) + 1
             continue
 
