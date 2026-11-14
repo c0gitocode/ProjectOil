@@ -1,0 +1,573 @@
+"""Ekonometrik test ve modelleme paketi.
+
+Yöntem çerçevesi:
+1. Birim kök & durağanlık:
+   - Seviye serileri: ADF (H0: birim kök, sabit+trend 'ct') ve KPSS (H0: trend-durağan 'ct').
+   - 1. fark serileri: ADF ve KPSS sabit terimle ('c'), çünkü doğrusal trendin farkı sabit sürüklenmeye dönüşür.
+2. Kesintili zaman serisi (ITS) modelleri, Newey-West HAC standart hatalarıyla:
+   - Seviye ITS:
+       y_t = a + b*trend + c*post + d*post*(trend - t0) + ay kuklaları + e_t
+   - 1. Fark ITS (seviye I(1) çıktığında sahte regresyonu önlemek için):
+       dy_t = mu + c_d*d_post + d_d*post_lag + ay kuklaları + u_t
+     Burada d_post = Delta(post_t) kırılma ayındaki anlık seviye sıçramasını (c),
+     post_lag = post_{t-1} ise kırılma sonrası kalıcı aylık eğim/büyüme değişimini (d) ölçer.
+   HAC gecikmesi Newey-West kuralıyla seçilir: floor(4 * (T / 100)^(2/9)).
+3. Artık tanı testleri (OLS artıkları üzerinde):
+   - Durbin-Watson, Breusch-Godfrey LM otokorelasyon testi, Breusch-Pagan değişen varyans testi.
+4. Yapısal kırılma testleri:
+   - Bilinen tarihli Chow testi (temel [sabit, trend] + yeterli gözlem varsa mevsimsel kontrollü Chow).
+   - Quandt-Andrews sup-F ve sup-Wald (bilinmeyen kırılma tarihi, %15 trimming):
+     Andrews (1993) Tablo 1 (p=2, pi_0=0.15) kritik değerleri: sup-Wald %10=10.01, %5=11.79, %1=15.51.
+5. Duyarlılık bandı sağlamlık kontrolü:
+   - ±%5 ödeme payı varsayım bandı (Low / Baseline / High) altında ITS katsayı kararlılığı.
+6. İki yönlü sabit etkili (TWFE) Panel Farkların Farkı (DiD):
+   - panel_long.csv üzerinde ülke (alpha_i) ve ay-yıl (lambda_t) sabit etkileri +
+     bölge (ülke) bazında kümelenmiş standart hatalarla Treated x Post tahmini.
+"""
+from dataclasses import asdict, dataclass
+import inspect
+from typing import Dict, Iterable, List, Optional, Tuple
+import warnings
+
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from scipy import stats
+from statsmodels.stats.diagnostic import acorr_breusch_godfrey, het_breuschpagan
+from statsmodels.stats.stattools import durbin_watson
+from statsmodels.tools.sm_exceptions import InterpolationWarning
+from statsmodels.tsa.stattools import adfuller, kpss
+
+if __name__ == "__main__" and not __package__:
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    __package__ = "src"
+
+from .config import BREAK_DATE, END_DATE, FILES, OUTPUTS_DIR, START_DATE
+from .logger import get_logger, setup_logging
+
+log = get_logger(__name__)
+
+TARGETS = {
+    "GLOBAL_PETRODOLAR": "Global Petrodolar (KBD)",
+    "GLOBAL_PETROYUAN": "Global Petroyuan (KBD)",
+    "PETROYUAN_SHARE_PCT": "Petroyuan Payı (%)",
+}
+
+# Andrews (1993), Econometrica 61(4), Table 1: p = 2 (const, trend), trimming pi_0 = 0.15
+ANDREWS_1993_SUP_WALD_CV = {0.10: 10.01, 0.05: 11.79, 0.01: 15.51}
+
+
+def _legacy_result_kwarg(fn) -> Dict[str, bool]:
+    return {"result_object": False} if "result_object" in inspect.signature(fn).parameters else {}
+
+
+def newey_west_lags(n: int) -> int:
+    return max(1, int(np.floor(4 * (max(n, 1) / 100) ** (2 / 9))))
+
+
+def _calendar_trend(index: pd.DatetimeIndex) -> np.ndarray:
+    """Boşluk bırakılmış aylarda bile gerçek takvim mesafesini (ay cinsinden) korur."""
+    idx = pd.DatetimeIndex(index)
+    return ((idx.year - idx[0].year) * 12 + (idx.month - idx[0].month)).astype(float)
+
+
+def _month_dummies(index: pd.DatetimeIndex) -> pd.DataFrame:
+    idx = pd.DatetimeIndex(index)
+    cats = pd.Categorical(idx.month, categories=list(range(1, 13)))
+    months = pd.get_dummies(cats, prefix="m", drop_first=True, dtype=float)
+    months.index = idx
+    return months.loc[:, (months != 0).any(axis=0)]
+
+
+def andrews_significance(sup_wald: float) -> str:
+    if np.isnan(sup_wald):
+        return "hesaplanamadı"
+    if sup_wald >= ANDREWS_1993_SUP_WALD_CV[0.01]:
+        return "p < 0.01 (***)"
+    if sup_wald >= ANDREWS_1993_SUP_WALD_CV[0.05]:
+        return "p < 0.05 (**)"
+    if sup_wald >= ANDREWS_1993_SUP_WALD_CV[0.10]:
+        return "p < 0.10 (*)"
+    return "p >= 0.10 (anlamsız)"
+
+
+# ---------------------------------------------------------
+# 1. Birim kök & Durağanlık
+# ---------------------------------------------------------
+def unit_root_tests(y: pd.Series) -> pd.DataFrame:
+    rows = []
+    specs = (("seviye", y.dropna(), "ct"), ("1. fark", y.diff().dropna(), "c"))
+    for label, s, reg in specs:
+        if len(s) < 10 or s.nunique(dropna=True) <= 1 or np.isclose(s.std(ddof=0), 0.0):
+            rows.append(
+                {
+                    "seri": label,
+                    "regresyon": reg,
+                    "ADF_stat": np.nan,
+                    "ADF_p": np.nan,
+                    "KPSS_stat": np.nan,
+                    "KPSS_p": np.nan,
+                }
+            )
+            continue
+        adf_stat, adf_p, *_ = adfuller(s, regression=reg, autolag="AIC", **_legacy_result_kwarg(adfuller))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", InterpolationWarning)  # p-değeri tablo sınırında kırpılır
+            kpss_stat, kpss_p, *_ = kpss(s, regression=reg, nlags="auto", **_legacy_result_kwarg(kpss))
+        rows.append(
+            {
+                "seri": label,
+                "regresyon": reg,
+                "ADF_stat": float(adf_stat),
+                "ADF_p": float(adf_p),
+                "KPSS_stat": float(kpss_stat),
+                "KPSS_p": float(kpss_p),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------
+# 2. ITS Modelleri (Seviye + 1. Fark) ve Artık Tanıları
+# ---------------------------------------------------------
+def design_matrix(index: pd.DatetimeIndex, break_date: str = BREAK_DATE, seasonal: bool = True) -> pd.DataFrame:
+    idx = pd.DatetimeIndex(index)
+    t = _calendar_trend(idx)
+    bd = pd.Timestamp(break_date)
+    post = (idx >= bd).astype(float)
+    t0 = float((bd.year - idx[0].year) * 12 + (bd.month - idx[0].month))
+    X = pd.DataFrame({"const": 1.0, "trend": t, "post": post, "post_trend": post * np.maximum(0.0, t - t0)}, index=idx)
+    if seasonal:
+        X = X.join(_month_dummies(idx))
+    return X
+
+
+def diff_design_matrix(
+    level_index: pd.DatetimeIndex,
+    diff_index: pd.DatetimeIndex,
+    break_date: str = BREAK_DATE,
+    seasonal: bool = True,
+) -> pd.DataFrame:
+    """Seviye ITS denkleminin tam 1. fark tasarımı:
+
+    Delta(c*post_t + d*post_t*(t-t0)) = c*d_post_t + d*post_{t-1}.
+    Böylece `d_post` kırılma ayındaki anlık seviye sıçramasını, `post_lag` kalıcı eğim değişimini verir.
+    """
+    idx = pd.DatetimeIndex(level_index)
+    bd = pd.Timestamp(break_date)
+    post = pd.Series((idx >= bd).astype(float), index=idx)
+    d_post = post.diff().reindex(diff_index).fillna(0.0)
+    post_lag = post.shift(1).reindex(diff_index).fillna(0.0)
+
+    X = pd.DataFrame({"const": 1.0, "d_post": d_post.to_numpy(), "post_lag": post_lag.to_numpy()}, index=diff_index)
+    if seasonal:
+        X = X.join(_month_dummies(pd.DatetimeIndex(diff_index)))
+    return X
+
+
+def its_regression(y: pd.Series, break_date: str = BREAK_DATE, seasonal: bool = True):
+    y = y.dropna()
+    X = design_matrix(y.index, break_date, seasonal)
+    lags = newey_west_lags(len(y))
+    return sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": lags}), lags
+
+
+def its_diff_regression(y: pd.Series, break_date: str = BREAK_DATE, seasonal: bool = True):
+    y_clean = y.dropna()
+    dy = y_clean.diff().dropna()
+    X = diff_design_matrix(y_clean.index, dy.index, break_date, seasonal)
+    lags = newey_west_lags(len(dy))
+    return sm.OLS(dy, X).fit(cov_type="HAC", cov_kwds={"maxlags": lags}), lags
+
+
+def residual_diagnostics(y: pd.Series, X: pd.DataFrame, bg_lags: Optional[int] = None) -> Dict[str, float]:
+    ols = sm.OLS(y, X).fit()
+    dw = float(durbin_watson(ols.resid)) if len(y) > 1 else float("nan")
+
+    max_bg = max(1, len(y) - X.shape[1] - 2)
+    lags = min(bg_lags or newey_west_lags(len(y)), max_bg)
+    if lags >= 1 and len(y) > X.shape[1] + lags + 1:
+        bg_stat, bg_p, _, _ = acorr_breusch_godfrey(ols, nlags=lags, **_legacy_result_kwarg(acorr_breusch_godfrey))
+    else:
+        bg_stat, bg_p = float("nan"), float("nan")
+
+    if len(y) > X.shape[1] + 1 and ols.model.exog.shape[1] >= 2:
+        bp_stat, bp_p, _, _ = het_breuschpagan(ols.resid, ols.model.exog)
+    else:
+        bp_stat, bp_p = float("nan"), float("nan")
+
+    return {
+        "dw_stat": float(dw),
+        "bg_lags": int(lags),
+        "bg_stat": float(bg_stat),
+        "bg_p": float(bg_p),
+        "bp_stat": float(bp_stat),
+        "bp_p": float(bp_p),
+    }
+
+
+# ---------------------------------------------------------
+# 3. Yapısal Kırılma Testleri (Chow & Quandt-Andrews)
+# ---------------------------------------------------------
+def chow_test(y: pd.Series, X: pd.DataFrame, split: int) -> Tuple[float, float]:
+    k, n = X.shape[1], len(y)
+    if split <= k or (n - split) <= k:
+        return float("nan"), float("nan")
+    X1, X2 = X.iloc[:split], X.iloc[split:]
+    if np.linalg.matrix_rank(X1) < k or np.linalg.matrix_rank(X2) < k:
+        return float("nan"), float("nan")
+    rss_p = sm.OLS(y, X).fit().ssr
+    rss_u = sm.OLS(y.iloc[:split], X1).fit().ssr + sm.OLS(y.iloc[split:], X2).fit().ssr
+    if rss_u <= 0 or n - 2 * k <= 0:
+        return float("nan"), float("nan")
+    f = ((rss_p - rss_u) / k) / (rss_u / (n - 2 * k))
+    return float(f), float(stats.f.sf(f, k, n - 2 * k))
+
+
+def quandt_andrews(y: pd.Series, trim: float = 0.15) -> Tuple[pd.Timestamp, float, float, pd.Series]:
+    trend = pd.Series(_calendar_trend(y.index), index=y.index, name="trend")
+    X = sm.add_constant(trend)
+    k = X.shape[1]
+    lo = max(k + 1, int(np.floor(len(y) * trim)))
+    hi = min(len(y) - k - 1, int(np.ceil(len(y) * (1 - trim))))
+    f_map = {}
+    for i in range(lo, hi):
+        f_val, _ = chow_test(y, X, i)
+        if np.isfinite(f_val):
+            f_map[y.index[i]] = f_val
+    if not f_map:
+        return y.index[len(y) // 2], float("nan"), float("nan"), pd.Series(dtype=float)
+    f_stats = pd.Series(f_map)
+    sup_f = float(f_stats.max())
+    sup_wald = float(k * sup_f)  # p=2 için sup-Wald = 2 * sup-F
+    return f_stats.idxmax(), sup_f, sup_wald, f_stats
+
+
+# ---------------------------------------------------------
+# 4. Tek Seri Analiz & Rapor
+# ---------------------------------------------------------
+@dataclass
+class Summary:
+    seri: str
+    n_pre: int
+    n_post: int
+    mean_pre: float
+    mean_post: float
+    its_level_shift: float
+    its_level_p: float
+    its_slope_change: float
+    its_slope_p: float
+    its_r2: float
+    diff_level_shift: float
+    diff_level_p: float
+    diff_slope_change: float
+    diff_slope_p: float
+    hac_lags: int
+    dw_stat: float
+    bg_p: float
+    bp_p: float
+    chow_F: float
+    chow_p: float
+    chow_seasonal_F: float
+    chow_seasonal_p: float
+    qa_break: str
+    qa_supF: float
+    qa_supWald: float
+    qa_sig: str
+    adf_level_p: float
+    kpss_level_p: float
+    adf_diff_p: float
+    kpss_diff_p: float
+
+
+def analyze(y: pd.Series, name: str, break_date: str = BREAK_DATE) -> Tuple[Summary, List[str]]:
+    y = y.dropna().sort_index()
+    bd = pd.Timestamp(break_date)
+    pre, post = y[y.index < bd], y[y.index >= bd]
+
+    ur = unit_root_tests(y)
+    X_level = design_matrix(y.index, break_date, seasonal=True)
+    model, lags = its_regression(y, break_date, seasonal=True)
+    diag = residual_diagnostics(y, X_level, bg_lags=lags)
+
+    diff_model, diff_lags = its_diff_regression(y, break_date, seasonal=True)
+
+    X_base = sm.add_constant(pd.Series(_calendar_trend(y.index), index=y.index, name="trend"))
+    chow_f, chow_p = chow_test(y, X_base, len(pre))
+    chow_s_f, chow_s_p = chow_test(y, X_base.join(_month_dummies(y.index)), len(pre))
+
+    qa_date, qa_f, qa_w, _ = quandt_andrews(y)
+    qa_sig = andrews_significance(qa_w)
+
+    t_stat, t_p = stats.ttest_ind(pre, post, equal_var=False)
+    u_stat, u_p = stats.mannwhitneyu(pre, post, alternative="two-sided")
+
+    s = Summary(
+        seri=name,
+        n_pre=len(pre),
+        n_post=len(post),
+        mean_pre=float(pre.mean()),
+        mean_post=float(post.mean()),
+        its_level_shift=float(model.params["post"]),
+        its_level_p=float(model.pvalues["post"]),
+        its_slope_change=float(model.params["post_trend"]),
+        its_slope_p=float(model.pvalues["post_trend"]),
+        its_r2=float(model.rsquared),
+        diff_level_shift=float(diff_model.params["d_post"]),
+        diff_level_p=float(diff_model.pvalues["d_post"]),
+        diff_slope_change=float(diff_model.params["post_lag"]),
+        diff_slope_p=float(diff_model.pvalues["post_lag"]),
+        hac_lags=lags,
+        dw_stat=diag["dw_stat"],
+        bg_p=diag["bg_p"],
+        bp_p=diag["bp_p"],
+        chow_F=chow_f,
+        chow_p=chow_p,
+        chow_seasonal_F=chow_s_f,
+        chow_seasonal_p=chow_s_p,
+        qa_break=qa_date.strftime("%Y-%m"),
+        qa_supF=qa_f,
+        qa_supWald=qa_w,
+        qa_sig=qa_sig,
+        adf_level_p=float(ur.loc[0, "ADF_p"]),
+        kpss_level_p=float(ur.loc[0, "KPSS_p"]),
+        adf_diff_p=float(ur.loc[1, "ADF_p"]),
+        kpss_diff_p=float(ur.loc[1, "KPSS_p"]),
+    )
+
+    sig = lambda p: "anlamlı" if np.isfinite(p) and p < 0.05 else "anlamsız"  # noqa: E731
+    lines = [
+        "=" * 82,
+        f" {name}",
+        "=" * 82,
+        f"Örneklem: {y.index.min():%Y-%m} – {y.index.max():%Y-%m} | Öncesi {len(pre)} ay, sonrası {len(post)} ay",
+        f"Ortalama: öncesi {pre.mean():.2f} | sonrası {post.mean():.2f}",
+        "",
+        "1) Birim kök & durağanlık testleri (seviye='ct', 1. fark='c')",
+        ur.to_string(index=False, float_format=lambda v: f"{v:.4f}"),
+        "",
+        f"2) Seviye ITS regresyonu + HAC (Newey-West, {lags} gecikme, ay kuklaları dahil)",
+        f"   Seviye kayması (post)      : {s.its_level_shift:10.3f}  p={s.its_level_p:.4f} ({sig(s.its_level_p)})",
+        f"   Eğim değişimi (post_trend) : {s.its_slope_change:10.3f}  p={s.its_slope_p:.4f} ({sig(s.its_slope_p)})",
+        f"   R²                         : {s.its_r2:.4f}",
+        f"   Artık tanıları: DW={s.dw_stat:.3f} | BG({diag['bg_lags']}) p={s.bg_p:.4g} | BP p={s.bp_p:.4g}",
+        "",
+        f"3) 1. Fark ITS regresyonu + HAC (Newey-West, {diff_lags} gecikme, I(1) kontrolü)",
+        f"   Anlık kırılma sıçraması (d_post) : {s.diff_level_shift:10.3f}  p={s.diff_level_p:.4f} ({sig(s.diff_level_p)})",
+        f"   Kalıcı büyüme farkı (post_lag)   : {s.diff_slope_change:10.3f}  p={s.diff_slope_p:.4f} ({sig(s.diff_slope_p)})",
+        "",
+        f"4) Chow testi ({bd:%Y-%m}): temel F={chow_f:.3f} p={chow_p:.4g} ({sig(chow_p)}) | "
+        f"mevsimsel F={chow_s_f:.3f} p={chow_s_p:.4g} ({sig(chow_s_p)})",
+        f"5) Quandt-Andrews (%15 trimming, p=2): en olası kırılma {s.qa_break}, "
+        f"sup-F={qa_f:.3f}, sup-Wald={qa_w:.3f} -> {qa_sig}",
+        "   [Andrews (1993) Tablo 1 sup-Wald kritik değerleri: %10=10.01, %5=11.79, %1=15.51]",
+        "",
+        "6) Betimsel (otokorelasyonu yok sayar)",
+        f"   Welch t={t_stat:.3f} p={t_p:.4g} | Mann-Whitney U={u_stat:.1f} p={u_p:.4g}",
+        "",
+    ]
+    if np.isfinite(s.adf_level_p) and np.isfinite(s.kpss_level_p) and s.adf_level_p > 0.05 and s.kpss_level_p < 0.05:
+        lines.insert(
+            -1,
+            "   [Not] Seviye serisi I(1) görünüyor; çıkarımda Bölüm 3 (1. Fark ITS) ve Bölüm 7 (Panel FE DiD) esas alınmalıdır.",
+        )
+    return s, lines
+
+
+# ---------------------------------------------------------
+# 5. Duyarlılık Bandı Sağlamlık Kontrolü (±%5)
+# ---------------------------------------------------------
+def sensitivity_robustness(df: pd.DataFrame, break_date: str = BREAK_DATE) -> pd.DataFrame:
+    df = df.dropna(subset=["GLOBAL_PETROYUAN", "GLOBAL_PETRODOLAR", "GLOBAL_TOTAL_KBD"]).sort_index()
+    if df.empty:
+        return pd.DataFrame()
+
+    scenarios: List[Tuple[str, str, pd.Series]] = []
+    if "GLOBAL_PETROYUAN_Low_KBD" in df.columns and "GLOBAL_PETROYUAN_High_KBD" in df.columns:
+        scenarios.extend(
+            [
+                ("Global Petroyuan (KBD)", "Low (-%5)", df["GLOBAL_PETROYUAN_Low_KBD"]),
+                ("Global Petroyuan (KBD)", "Baseline", df["GLOBAL_PETROYUAN"]),
+                ("Global Petroyuan (KBD)", "High (+%5)", df["GLOBAL_PETROYUAN_High_KBD"]),
+            ]
+        )
+        total = df["GLOBAL_TOTAL_KBD"].replace(0, np.nan)
+        scenarios.extend(
+            [
+                ("Petroyuan Payı (%)", "Low (-%5)", df["GLOBAL_PETROYUAN_Low_KBD"] / total * 100.0),
+                ("Petroyuan Payı (%)", "Baseline", df["PETROYUAN_SHARE_PCT"]),
+                ("Petroyuan Payı (%)", "High (+%5)", df["GLOBAL_PETROYUAN_High_KBD"] / total * 100.0),
+            ]
+        )
+    if "GLOBAL_PETRODOLAR_Low_KBD" in df.columns and "GLOBAL_PETRODOLAR_High_KBD" in df.columns:
+        scenarios.extend(
+            [
+                ("Global Petrodolar (KBD)", "Low (+%5 py)", df["GLOBAL_PETRODOLAR_Low_KBD"]),
+                ("Global Petrodolar (KBD)", "Baseline", df["GLOBAL_PETRODOLAR"]),
+                ("Global Petrodolar (KBD)", "High (-%5 py)", df["GLOBAL_PETRODOLAR_High_KBD"]),
+            ]
+        )
+
+    rows = []
+    for target_name, scen_name, series in scenarios:
+        s = series.dropna()
+        if len(s) < 16:
+            continue
+        lvl, _ = its_regression(s, break_date, seasonal=True)
+        diff, _ = its_diff_regression(s, break_date, seasonal=True)
+        rows.append(
+            {
+                "seri": target_name,
+                "senaryo": scen_name,
+                "its_level_shift": float(lvl.params["post"]),
+                "its_level_p": float(lvl.pvalues["post"]),
+                "its_slope_change": float(lvl.params["post_trend"]),
+                "its_slope_p": float(lvl.pvalues["post_trend"]),
+                "diff_level_shift": float(diff.params["d_post"]),
+                "diff_level_p": float(diff.pvalues["d_post"]),
+                "diff_slope_change": float(diff.params["post_lag"]),
+                "diff_slope_p": float(diff.pvalues["post_lag"]),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------
+# 6. İki Yönlü Sabit Etkili Panel DiD (TWFE + Kümelenmiş SE)
+# ---------------------------------------------------------
+def panel_fe_did(
+    panel_df: pd.DataFrame,
+    break_date: str = BREAK_DATE,
+    treated_regions: Iterable[str] = ("CN", "IN"),
+) -> pd.DataFrame:
+    df_p = panel_df.copy()
+    df_p["Date"] = pd.to_datetime(df_p["Date"])
+    if "total_kbd" not in df_p.columns:
+        df_p["total_kbd"] = df_p["petrodollar_kbd"] + df_p["petroyuan_kbd"]
+    if "petroyuan_share_pct" not in df_p.columns:
+        df_p["petroyuan_share_pct"] = np.where(
+            df_p["total_kbd"] > 0, df_p["petroyuan_kbd"] / df_p["total_kbd"] * 100.0, np.nan
+        )
+
+    bd = pd.Timestamp(break_date)
+    treated_set = set(treated_regions)
+    df_p["treated"] = df_p["region"].isin(treated_set).astype(float)
+    df_p["post"] = (df_p["Date"] >= bd).astype(float)
+    df_p["treated_post"] = df_p["treated"] * df_p["post"]
+
+    rows = []
+    for col, label in (
+        ("petroyuan_kbd", "Ülke Petroyuan Hacmi (KBD)"),
+        ("petroyuan_share_pct", "Ülke Petroyuan Payı (%)"),
+    ):
+        sub = df_p.dropna(subset=[col, "region", "Date"]).copy()
+        n_regions = sub["region"].nunique()
+        n_months = sub["Date"].nunique()
+        if n_regions < 2 or n_months < 2 or sub["treated_post"].nunique() < 2:
+            continue
+
+        reg_d = pd.get_dummies(sub["region"], prefix="reg", drop_first=True, dtype=float)
+        time_d = pd.get_dummies(sub["Date"].dt.strftime("%Y-%m"), prefix="t", drop_first=True, dtype=float)
+        X_fe = pd.concat([pd.Series(1.0, index=sub.index, name="const"), reg_d, time_d], axis=1)
+
+        y_vec = sub[col].astype(float)
+        x_vec = sub["treated_post"].astype(float)
+        # Frisch-Waugh-Lovell (FWL): Sabit etkileri (ulke + ay-yil) ortogonalize ederek tam
+        # katsayiyi korur, G << K kukla kaynakli nuans matris sayisal hatalarini onler.
+        y_res = sm.OLS(y_vec, X_fe).fit().resid
+        x_res = sm.OLS(x_vec, X_fe).fit().resid
+        if np.isclose(x_res.std(ddof=0), 0.0):
+            continue
+
+        fwl = sm.OLS(y_res, x_res.to_frame("treated_post")).fit(
+            cov_type="cluster", cov_kwds={"groups": sub["region"]}
+        )
+        n_obs = len(sub)
+        k_full = int(np.linalg.matrix_rank(X_fe)) + 1
+        dof_scale = float(np.sqrt((n_obs - 1) / max(1, n_obs - k_full)))
+        se_cluster = float(fwl.bse["treated_post"] * dof_scale)
+        coef = float(fwl.params["treated_post"])
+        t_stat = float(coef / se_cluster) if se_cluster > 0 else float("nan")
+        p_val = float(2.0 * stats.t.sf(abs(t_stat), df=n_regions - 1)) if np.isfinite(t_stat) else float("nan")
+        overall_r2 = float(sm.OLS(y_vec, pd.concat([sub[["treated_post"]], X_fe], axis=1)).fit().rsquared)
+
+        rows.append(
+            {
+                "bagimli_degisken": label,
+                "did_katsayisi": coef,
+                "se_kumelenmis": se_cluster,
+                "t_ist": t_stat,
+                "p_degeri": p_val,
+                "r2_toplam": overall_r2,
+                "r2_within": float(fwl.rsquared),
+                "n_gozlem": int(n_obs),
+                "n_ulke": int(n_regions),
+                "n_ay": int(n_months),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def run_tests(targets: Dict[str, str] = TARGETS) -> bool:
+    path = FILES["global"]
+    if not path.exists():
+        log.error("Ekonometri: %s bulunamadı.", path.name)
+        return False
+    df = pd.read_csv(path, index_col=0, parse_dates=True).sort_index().loc[START_DATE:END_DATE]
+    if df.empty:
+        log.error("Ekonometri: %s içinde %s–%s aralığında veri yok.", path.name, START_DATE, END_DATE)
+        return False
+    df = df.asfreq("MS")
+    if df.isna().all(axis=1).any():
+        log.warning("Global seride ay boşlukları var (complete-case). Testler boşluksuz alt örneklem üzerinde.")
+
+    summaries, report = [], []
+    for col, name in targets.items():
+        if col not in df.columns:
+            continue
+        s, lines = analyze(df[col], name)
+        summaries.append(asdict(s))
+        report.extend(lines)
+
+    sens_df = sensitivity_robustness(df)
+    if not sens_df.empty:
+        sens_df.to_csv(OUTPUTS_DIR / "econometrics_sensitivity.csv", index=False)
+        report.extend(
+            [
+                "=" * 82,
+                " 7) Varsayım Duyarlılık Bandı Sağlamlık Kontrolü (±%5)",
+                "=" * 82,
+                sens_df.to_string(index=False, float_format=lambda v: f"{v:.3f}"),
+                "",
+            ]
+        )
+
+    if FILES["panel"].exists():
+        panel_raw = pd.read_csv(FILES["panel"])
+        panel_df = panel_fe_did(panel_raw)
+        if not panel_df.empty:
+            panel_df.to_csv(OUTPUTS_DIR / "econometrics_panel_summary.csv", index=False)
+            report.extend(
+                [
+                    "=" * 82,
+                    " 8) İki Yönlü Sabit Etkili Panel DiD (Ülke + Ay-Yıl FE, Bölge Kümelenmiş SE)",
+                    "=" * 82,
+                    panel_df.to_string(index=False, float_format=lambda v: f"{v:.4f}"),
+                    "",
+                ]
+            )
+
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    (OUTPUTS_DIR / "econometrics_report.txt").write_text("\n".join(report), encoding="utf-8")
+    pd.DataFrame(summaries).to_csv(OUTPUTS_DIR / "econometrics_summary.csv", index=False)
+    print("\n".join(report))
+    log.info("Ekonometri raporu kaydedildi: outputs/econometrics_report.txt")
+    return True
+
+
+if __name__ == "__main__":
+    setup_logging()
+    run_tests()

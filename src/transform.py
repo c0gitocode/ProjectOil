@@ -1,340 +1,545 @@
-import os
-import glob
+"""Transform katmanı.
+
+Tasarım: her hesap saf (pure) bir `compute_*` fonksiyonudur (DataFrame alır, DataFrame döndürür,
+dosyaya dokunmaz) ve test edilebilir. `run_*` fonksiyonları sadece dosya okuma/yazma yapar.
+
+Ekonometrik ilkeler:
+* Eksik veri 0 ile doldurulmaz ve ileriye taşınmaz (ffill yok). Eksik ay NaN kalır, global
+  seride ise tam-gözlem (complete-case) örneklemi kullanılır ve düşen aylar loglanır.
+* JODI 'Diğer' toplamında örneklem boyunca sabit ülke sepeti (balanced basket) korunur;
+  düzensiz raporlayan ülkelerin giriş-çıkışından doğan sahte sıçramalar önlenir.
+* Tüm akımlar KBD (bin varil/gün) birimindedir; dönüşümler sadece `units.py`'dedir.
+* Ödeme para birimi payları kodda değil, `data/assumptions/*.csv` dosyalarındadır.
+"""
+from functools import reduce
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional
+
 import numpy as np
 import pandas as pd
-import warnings
-from typing import Optional, Dict, Tuple
-from functools import reduce
-from config import RAW_DIR, PROCESSED_DIR
 
-warnings.filterwarnings("ignore")
+from .config import (
+    ASSUMPTION_FILES,
+    BAND_START,
+    BBL_PER_TONNE,
+    CHINA_RAW_DIR,
+    END_DATE,
+    FILES,
+    JODI_REQUIRED_COVERAGE,
+    RAW_DIR,
+    SENSITIVITY,
+    START_DATE,
+)
+from .extract.common import atomic_write_csv, normalize_epdk_columns, parse_number
+from .logger import get_logger
+from .units import kg_to_kbd, tonnes_to_kbd
+
+log = get_logger(__name__)
+
+# Ayrı ulusal kaynaklardan (DGCIS/GACC/EIA/EPDK) modellenen ülkeler JODI toplamına ve paneline
+# tekrar dahil edilmez (çift sayım önlemi).
+JODI_EXCLUDED_FROM_OTHER = {"IN", "IND", "CN", "CHN", "US", "USA", "TR", "TUR"}
+
+# GACC partner adı (küçük harf) -> varsayım grubu
+CHINA_PARTNER_GROUPS = {
+    "russia": "russia",
+    "russian federation": "russia",
+    "iran": "iran_venezuela",
+    "iran, islamic rep.": "iran_venezuela",
+    "venezuela": "iran_venezuela",
+    "malaysia": "malaysia",
+    "indonesia": "indonesia",
+    "saudi arabia": "saudi",
+    "united arab emirates": "uae",
+    "uae": "uae",
+    "iraq": "iraq",
+    "oman": "oman",
+    "brazil": "brazil",
+}
+
+SCENARIOS = ("", "_High", "_Low")
 
 
-# ---------------------------------------------------------
-# 1. TÜRKİYE / TÜİK & EPDK BİRLEŞTİRME
-# ---------------------------------------------------------
-def tuik_excel_temizle(dosya_yolu: str, veri_kolon_adi: str) -> pd.DataFrame:
-    df_raw = pd.read_excel(dosya_yolu, header=None)
-
-    # Vektörel başlık tespiti
-    mask = df_raw.astype(str).map(lambda x: str(x).upper()).apply(
-        lambda row: 'YIL' in row.values and 'AY' in row.values, axis=1)
-    header_idx = mask.idxmax() if mask.any() else 0
-
-    df = pd.read_excel(dosya_yolu, skiprows=header_idx)
-    df = df.rename(columns={df.columns[0]: 'Yil', df.columns[1]: 'Ay', df.columns[-1]: 'Deger'})
-
-    df['Yil'] = pd.to_numeric(df['Yil'].ffill(), errors='coerce')
-    df['Ay'] = pd.to_numeric(df['Ay'], errors='coerce')
-    df['Deger'] = pd.to_numeric(df['Deger'], errors='coerce')
-    df = df.dropna(subset=['Ay', 'Deger'])
-
-    df['Tarih'] = pd.to_datetime(df['Yil'].astype(int).astype(str) + "-" + df['Ay'].astype(int).astype(str) + "-01")
-    indicator_col = df.columns[2]
-
-    if any(keyword in str(indicator_col).lower() for keyword in ['ödeme', 'odeme', 'ruble', 'yuan']):
-        df = df.pivot_table(index='Tarih', columns=indicator_col, values='Deger', aggfunc='sum').reset_index()
-        new_cols = ['Tarih']
-        for col in df.columns[1:]:
-            if 'Ruble' in str(col):
-                new_cols.append('RUB_USD')
-            elif 'Yuan' in str(col):
-                new_cols.append('CNY_USD')
-            else:
-                new_cols.append(f"Doviz_{col}")
-        df.columns = new_cols
-    else:
-        df = df.groupby('Tarih')['Deger'].sum().reset_index()
-        df.columns = ['Tarih', veri_kolon_adi]
+# =========================================================
+# Ortak: varsayım (pay) tabloları
+# =========================================================
+def load_shares(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path, parse_dates=["effective_from"])
+    bad = df[(df["alt_share"] < 0) | (df["alt_share"] > 1)]
+    if not bad.empty:
+        raise ValueError(f"{path.name}: alt_share [0,1] dışında değerler içeriyor:\n{bad}")
     return df
 
 
-def master_analiz_olustur() -> None:
-    print("[*] Türkiye Master Analiz (TÜİK & EPDK) oluşturuluyor...")
-
-    doviz_dosyalari = glob.glob(os.path.join(RAW_DIR, "*ruble-yuan*.xlsx"))
-    df_doviz = pd.concat([tuik_excel_temizle(f, "Doviz") for f in doviz_dosyalari]).groupby(
-        'Tarih').sum().reset_index() if doviz_dosyalari else pd.DataFrame(columns=['Tarih'])
-
-    rusya_dosyalari = [f for f in glob.glob(os.path.join(RAW_DIR, "*rusya*.xlsx")) if "petrol" not in f.lower()]
-    df_rusya = pd.concat([tuik_excel_temizle(f, "Rusya_Toplam_USD") for f in rusya_dosyalari]).groupby(
-        'Tarih').sum().reset_index() if rusya_dosyalari else pd.DataFrame(columns=['Tarih'])
-
-    enerji_dosyalari = glob.glob(os.path.join(RAW_DIR, "*fasil27*.xlsx"))
-    df_enerji = pd.concat([tuik_excel_temizle(f, "Enerji_Fasil27_USD") for f in enerji_dosyalari]).groupby(
-        'Tarih').sum().reset_index() if enerji_dosyalari else pd.DataFrame(columns=['Tarih'])
-
-    epdk_path = os.path.join(PROCESSED_DIR, "tr_epdk_master.csv")
-    df_epdk = pd.DataFrame(columns=['Tarih'])
-    if os.path.exists(epdk_path):
-        df_temp = pd.read_csv(epdk_path)
-        df_temp['Tarih'] = pd.to_datetime(df_temp['Tarih'])
-        miktar_col = next((c for c in df_temp.columns if 'RUSYA' in c.upper() and 'MIKTAR' in c.upper()),
-                          next((c for c in df_temp.columns if 'RUSYA' in c.upper()), None))
-        if miktar_col:
-            df_epdk = df_temp[['Tarih', miktar_col]].rename(columns={miktar_col: 'Rusya_Petrol_Miktar_EPDK'})
-
-    dfs = [df_doviz, df_rusya, df_enerji, df_epdk]
-    df_master = reduce(lambda left, right: pd.merge(left, right, on='Tarih', how='outer'), dfs).sort_values(
-        'Tarih').fillna(0)
-
-    master_out_path = os.path.join(PROCESSED_DIR, "MASTER_ANALYSIS.csv")
-    df_master.to_csv(master_out_path, index=False)
-    print(f"[+] Master analiz verisi oluşturuldu: {master_out_path}")
+def shares_for_dates(shares: pd.DataFrame, dates: Iterable) -> pd.DataFrame:
+    """Parça-sabit (piecewise constant) payları verilen aylara yayar. Son değer ileri taşınır."""
+    dates = pd.DatetimeIndex(pd.to_datetime(list(dates))).unique().sort_values()
+    if len(dates) == 0:
+        cols = sorted(shares["country_group"].unique()) if not shares.empty else []
+        return pd.DataFrame(index=dates, columns=cols, dtype=float)
+    wide = shares.pivot_table(index="effective_from", columns="country_group", values="alt_share", aggfunc="last")
+    out = wide.reindex(wide.index.union(dates)).sort_index().ffill().reindex(dates).fillna(0.0)
+    out.index.name = "Date"
+    return out
 
 
-# ---------------------------------------------------------
-# 2. ÇİN / GÜMRÜK VERİSİ İŞLEME (TÜM ÜLKELER DAHİL)
-# ---------------------------------------------------------
+def share_scenarios(
+    base: pd.DataFrame,
+    sensitivity: float = SENSITIVITY,
+    band_start: str = BAND_START,
+) -> Dict[str, pd.DataFrame]:
+    """Baz, yüksek ve düşük senaryo payları. Bant sadece band_start sonrası uygulanır
+    (öncesinde varsayım belirsizliği yok; eski kod 2018'den itibaren tüm ülkelere +%5 ekliyordu)."""
+    active = pd.DataFrame(
+        np.broadcast_to((base.index >= pd.Timestamp(band_start))[:, None], base.shape),
+        index=base.index,
+        columns=base.columns,
+    )
+    high = base.where(~active, (base + sensitivity).clip(0, 1))
+    low = base.where(~active, (base - sensitivity).clip(0, 1))
+    return {"": base, "_High": high, "_Low": low}
 
-def process_china_oil_data() -> bool:
-    print("[*] Çin ham petrol ithalat verileri işleniyor...")
-    file_list = glob.glob(os.path.join(RAW_DIR, "china", "*_china.csv"))
-    if not file_list:
-        print("[!] Çin için ham veri (CSV) bulunamadı.")
+
+# =========================================================
+# 1. TÜRKİYE (TÜİK Excel + EPDK)
+# =========================================================
+def _clean_tuik_excel(path: Path, value_name: str) -> pd.DataFrame:
+    raw = pd.read_excel(path, header=None)
+    upper = raw.astype(str).apply(lambda col: col.str.upper().str.strip())
+    mask = upper.apply(lambda r: "YIL" in r.values and "AY" in r.values, axis=1)
+    header_idx = int(mask.idxmax()) if mask.any() else 0
+
+    df = pd.read_excel(path, skiprows=header_idx)
+    df = df.rename(columns={df.columns[0]: "Yil", df.columns[1]: "Ay", df.columns[-1]: "Deger"})
+    df["Yil"] = pd.to_numeric(df["Yil"].ffill(), errors="coerce")
+    df["Ay"] = pd.to_numeric(df["Ay"], errors="coerce")
+    df["Deger"] = pd.to_numeric(df["Deger"], errors="coerce")
+    df = df.dropna(subset=["Yil", "Ay", "Deger"])
+    df["Tarih"] = pd.to_datetime(dict(year=df["Yil"].astype(int), month=df["Ay"].astype(int), day=1))
+
+    indicator = df.columns[2]
+    if any(k in str(indicator).lower() for k in ("ödeme", "odeme", "ruble", "yuan")):
+        df = df.pivot_table(index="Tarih", columns=indicator, values="Deger", aggfunc="sum")
+        df.columns = [
+            "RUB_USD" if "Ruble" in str(c) else "CNY_USD" if "Yuan" in str(c) else f"Doviz_{c}"
+            for c in df.columns
+        ]
+        return df.reset_index()
+    return df.groupby("Tarih", as_index=False)["Deger"].sum().rename(columns={"Deger": value_name})
+
+
+def _read_epdk() -> pd.DataFrame:
+    df = pd.read_csv(FILES["epdk"], parse_dates=["Tarih"])
+    return normalize_epdk_columns(df)
+
+
+def run_turkey_master() -> None:
+    def collect(pattern: str, name: str, exclude: Optional[str] = None) -> pd.DataFrame:
+        files = [f for f in RAW_DIR.glob(pattern) if not (exclude and exclude in f.name.lower())]
+        if not files:
+            return pd.DataFrame(columns=["Tarih"])
+        return (
+            pd.concat([_clean_tuik_excel(f, name) for f in files], ignore_index=True)
+            .groupby("Tarih", as_index=False)
+            .sum(numeric_only=True)
+        )
+
+    frames = [
+        collect("*ruble-yuan*.xlsx", "Doviz"),
+        collect("*rusya*.xlsx", "Rusya_Toplam_USD", exclude="petrol"),
+        collect("*fasil27*.xlsx", "Enerji_Fasil27_USD"),
+    ]
+    if FILES["epdk"].exists():
+        epdk_df = _read_epdk()
+        keep = [
+            c
+            for c in ("Tarih", "TR_Toplam_Ithalat_KBD", "TR_Rusya_Ithalat_KBD", "TR_Rusya_Disi_KBD")
+            if c in epdk_df.columns
+        ]
+        if len(keep) > 1:
+            frames.append(epdk_df[keep])
+
+    frames = [f for f in frames if len(f.columns) > 1]
+    if not frames:
+        log.warning("Türkiye master: girdi dosyası yok, atlandı.")
+        return
+    master = reduce(lambda l, r: pd.merge(l, r, on="Tarih", how="outer"), frames).sort_values("Tarih")
+    atomic_write_csv(master, FILES["tr_master"], index=False)  # NaN korunur (fillna(0) yok)
+    log.info("Türkiye master yazıldı: %d ay", len(master))
+
+
+# =========================================================
+# 2. ÇİN (GACC)
+# =========================================================
+def _read_csv_any_encoding(path: Path) -> pd.DataFrame:
+    for enc in ("utf-8", "utf-8-sig", "gbk", "utf-16", "latin1"):
+        try:
+            return pd.read_csv(path, encoding=enc, dtype=str)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    raise ValueError(f"{path.name} hiçbir kodlamayla okunamadı")
+
+
+def compute_china_imports(raw: pd.DataFrame) -> pd.DataFrame:
+    """GACC ham tablo(lar)ı -> uzun format: Date, Partner, Quantity_kg, USD, KBD, USD_per_bbl."""
+    df = raw.rename(columns=lambda c: str(c).strip())
+    required = {"Date of data", "Trading partner", "Quantity"}
+    if missing := required - set(df.columns):
+        raise KeyError(f"GACC dosyasında eksik sütunlar: {missing}")
+
+    date_str = df["Date of data"].astype(str).str.replace(r"[-/]", "", regex=True).str.strip().str[:6]
+    out = pd.DataFrame(
+        {
+            "Date": pd.to_datetime(date_str, format="%Y%m", errors="coerce"),
+            "Partner": df["Trading partner"].astype(str).str.strip(),
+            "Quantity_kg": df["Quantity"].map(lambda v: parse_number(v, locale="en")),
+            "USD": df["US dollar"].map(lambda v: parse_number(v, locale="en")) if "US dollar" in df.columns else np.nan,
+        }
+    ).dropna(subset=["Date"])
+
+    p_low = out["Partner"].str.lower()
+    out = out[~p_low.isin(["world", "", "nan", "none"])]
+    # Yıllık dosyalar çakışırsa (ör. güncel yıl yeniden indirildi) son okunan geçerli
+    out = out.drop_duplicates(subset=["Date", "Partner"], keep="last")
+
+    world = out.groupby("Date", as_index=False)[["Quantity_kg", "USD"]].sum(min_count=1)
+    world["Partner"] = "World"
+    out = pd.concat([out, world], ignore_index=True)
+
+    out["KBD"] = kg_to_kbd(out["Quantity_kg"], out["Date"])
+    barrels = out["Quantity_kg"] / 1000.0 * BBL_PER_TONNE
+    out["USD_per_bbl"] = (out["USD"] / barrels).where(barrels > 0)
+    return out.sort_values(["Date", "Partner"]).reset_index(drop=True)
+
+
+def compute_china_payment(imports: pd.DataFrame, shares: pd.DataFrame) -> pd.DataFrame:
+    """Ülke-grubu bazında petroyuan/petrodolar ayrıştırması (vektörel, ±bant senaryolu)."""
+    partners = imports[imports["Partner"] != "World"].copy()
+    partners["group"] = partners["Partner"].str.lower().map(CHINA_PARTNER_GROUPS)
+
+    total = imports[imports["Partner"] == "World"].set_index("Date")["KBD"].sort_index()
+    by_group = (
+        partners.dropna(subset=["group"])
+        .pivot_table(index="Date", columns="group", values="KBD", aggfunc="sum")
+        .reindex(total.index)
+        .fillna(0.0)
+    )
+
+    base = shares_for_dates(shares, total.index)
+    unknown = set(base.columns) - set(by_group.columns)
+    if unknown:
+        log.debug("Çin: verisi olmayan varsayım grupları: %s", unknown)
+    by_group = by_group.reindex(columns=base.columns, fill_value=0.0)
+
+    out = pd.DataFrame(index=total.index)
+    out["China_Total_KBD"] = total
+    py = {s: (by_group * sh).sum(axis=1) for s, sh in share_scenarios(base).items()}
+    out["China_Petroyuan_KBD"] = py[""]
+    out["China_Petroyuan_High_KBD"] = py["_High"]
+    out["China_Petroyuan_Low_KBD"] = py["_Low"]
+    # Bant semantiği: düşük petroyuan senaryosu <-> yüksek petrodolar senaryosu
+    out["China_Petrodolar_KBD"] = (total - py[""]).clip(lower=0)
+    out["China_Petrodolar_High_KBD"] = (total - py["_Low"]).clip(lower=0)
+    out["China_Petrodolar_Low_KBD"] = (total - py["_High"]).clip(lower=0)
+    for g in by_group.columns:
+        out[f"CN_{g}_KBD"] = by_group[g]
+    out.index.name = "Date"
+    return out.round(3)
+
+
+def run_china() -> bool:
+    files = sorted(CHINA_RAW_DIR.glob("*_china.csv"))
+    if not files:
+        log.warning(
+            "Çin ham verisi yok (%s). GACC adımını çalıştırın veya CSV'leri manuel koyun.",
+            CHINA_RAW_DIR,
+        )
         return False
+    imports = compute_china_imports(pd.concat([_read_csv_any_encoding(f) for f in files], ignore_index=True))
+    atomic_write_csv(imports, FILES["china_imports"], index=False)
 
-    df_list = []
-    for file in file_list:
-        for enc in ['utf-8', 'utf-8-sig', 'gbk', 'latin1', 'utf-16']:
-            try:
-                df_list.append(pd.read_csv(file, encoding=enc))
-                break
-            except UnicodeDecodeError:
-                continue
-
-    if not df_list:
-        print("[!] Dosyalar okunamadı (Encoding hatası).")
-        return False
-
-    df_raw = pd.concat(df_list, ignore_index=True)
-    df_raw.columns = df_raw.columns.str.strip()
-    numeric_cols = ['Quantity', 'Supplementary Quantity', 'US dollar']
-
-    for col in numeric_cols:
-        if col in df_raw.columns:
-            # Sütunları zorunlu olarak float formatına dönüştürüyoruz
-            df_raw[col] = pd.to_numeric(
-                df_raw[col].astype(str).str.replace(',', '', regex=False).str.strip(),
-                errors='coerce'
-            ).astype(float).fillna(0.0)
-
-    # Güvenli vektörel atama işlemi
-    if 'Supplementary Quantity' not in df_raw.columns:
-        df_raw['Supplementary Quantity'] = 0.0
-
-    if 'Quantity' in df_raw.columns:
-        mask = (df_raw['Supplementary Quantity'] == 0.0) | df_raw['Supplementary Quantity'].isna()
-        df_raw.loc[mask, 'Supplementary Quantity'] = df_raw.loc[mask, 'Quantity'] * 0.00733
-
-    df_raw = df_raw[df_raw['Trading partner'] != 'World']
-
-    df_world = df_raw.groupby('Date of data')[numeric_cols].sum().reset_index()
-    df_world['Trading partner'] = 'World'
-    df_world['Commodity code'] = 27090000
-
-    df_final = pd.concat([df_raw, df_world], ignore_index=True).sort_values(
-        by=['Date of data', 'Trading partner']).reset_index(drop=True)
-
-    output_file = os.path.join(PROCESSED_DIR, "china_oil_imports_processed.csv")
-    df_final.to_csv(output_file, index=False)
-    print(f"[+] Çin verisi işlendi ve kaydedildi: {output_file}")
-
-    return True
-
-# ---------------------------------------------------------
-# 3. HİNDİSTAN / DGCIS & JODI BİRLEŞTİRME VE DUYARLILIK
-# ---------------------------------------------------------
-def process_india_oil_data() -> bool:
-    print("[*] Hindistan ham petrol verileri (±%5 Duyarlılık Bandı ile) işleniyor...")
-    jodi_file = os.path.join(PROCESSED_DIR, "jodi_avrupa_asya_petrodolar.csv")
-    dgcis_file = os.path.join(PROCESSED_DIR, "russia_oil_ports_2018_2026.csv")
-    output_csv = os.path.join(PROCESSED_DIR, "hindistan_nihai_hacim_analizi_kbd.csv")
-
-    if not os.path.exists(jodi_file) or not os.path.exists(dgcis_file):
-        print("[!] JODI veya DGCIS csv dosyası eksik.")
-        return False
-
-    df_jodi = pd.read_csv(jodi_file)
-    df_jodi['TIME_PERIOD'] = pd.to_datetime(df_jodi['TIME_PERIOD'])
-    ind_cols = [col for col in ['IN', 'IND'] if col in df_jodi.columns]
-
-    df_jodi['JODI_Total_KBD'] = df_jodi[ind_cols].sum(axis=1) / df_jodi['TIME_PERIOD'].dt.daysinmonth
-    df_jodi_in = df_jodi[['TIME_PERIOD', 'JODI_Total_KBD']].rename(columns={'TIME_PERIOD': 'Date'})
-
-    df_dgcis = pd.read_csv(dgcis_file)
-    df_dgcis['Date'] = pd.to_datetime(df_dgcis['Period'], format='%b-%Y', errors='coerce')
-    df_dgcis['Qty_KBD'] = (pd.to_numeric(df_dgcis['Qty'].astype(str).str.replace(',', ''), errors='coerce').fillna(
-        0) * 7.33) / (1000 * df_dgcis['Date'].dt.daysinmonth)
-    df_dgcis_rus = df_dgcis.groupby('Date')['Qty_KBD'].sum().reset_index().rename(columns={'Qty_KBD': 'DGCIS_Rus_KBD'})
-
-    df = pd.merge(df_jodi_in, df_dgcis_rus, on='Date', how='left').fillna(0).sort_values('Date')
-
-    # Hindistan Oran Matrisi Oluşturma (Vektörel)
-    india_quarterly_alt_rates = {
-        (2022, 1): 0.024, (2022, 2): 0.080, (2022, 3): 0.108, (2022, 4): 0.150,
-        (2023, 1): 0.182, (2023, 2): 0.242, (2023, 3): 0.182, (2023, 4): 0.142,
-        (2024, 1): 0.221, (2024, 2): 0.261, (2024, 3): 0.281, (2024, 4): 0.301,
-        (2025, 1): 0.293, (2025, 2): 0.313, (2025, 3): 0.322, (2025, 4): 0.342,
-    }
-
-    df['Year'] = df['Date'].dt.year
-    df['Quarter'] = df['Date'].dt.quarter
-
-    def map_rate(row):
-        if row['Date'] < pd.to_datetime("2022-01-01"): return 0.0
-        if row['Year'] >= 2026: return india_quarterly_alt_rates[(2025, 4)]
-        return india_quarterly_alt_rates.get((row['Year'], row['Quarter']), 0.0)
-
-    df['Alt_Rate'] = df.apply(map_rate, axis=1)
-    df['Usd_Rate'] = 1.0 - df['Alt_Rate']
-
-    sensitivity = 0.05
-    df['Alt_Rate_High'] = np.clip(df['Alt_Rate'] + sensitivity, 0.0, 1.0)
-    df['Alt_Rate_Low'] = np.clip(df['Alt_Rate'] - sensitivity, 0.0, 1.0)
-
-    df['Rusya_Disi_KBD'] = np.maximum(0, df['JODI_Total_KBD'] - df['DGCIS_Rus_KBD'])
-
-    df['Petrodolar_KBD'] = df['Rusya_Disi_KBD'] + (df['DGCIS_Rus_KBD'] * df['Usd_Rate'])
-    df['Petroyuan_KBD'] = df['DGCIS_Rus_KBD'] * df['Alt_Rate']
-
-    df['Petroyuan_High_KBD'] = df['DGCIS_Rus_KBD'] * df['Alt_Rate_High']
-    df['Petroyuan_Low_KBD'] = df['DGCIS_Rus_KBD'] * df['Alt_Rate_Low']
-    df['Petrodolar_High_KBD'] = df['Rusya_Disi_KBD'] + (df['DGCIS_Rus_KBD'] * (1.0 - df['Alt_Rate_Low']))
-    df['Petrodolar_Low_KBD'] = df['Rusya_Disi_KBD'] + (df['DGCIS_Rus_KBD'] * (1.0 - df['Alt_Rate_High']))
-
-    df_final = df[['Date', 'JODI_Total_KBD', 'DGCIS_Rus_KBD', 'Rusya_Disi_KBD',
-                   'Petrodolar_KBD', 'Petrodolar_High_KBD', 'Petrodolar_Low_KBD',
-                   'Petroyuan_KBD', 'Petroyuan_High_KBD', 'Petroyuan_Low_KBD']]
-    df_final.columns = ['Date', 'Toplam_Ithalat_KBD', 'Rusya_Ithalat_KBD', 'Rusya_Disi_KBD',
-                        'Petrodolar_KBD', 'Petrodolar_High_KBD', 'Petrodolar_Low_KBD',
-                        'Petroyuan_KBD', 'Petroyuan_High_KBD', 'Petroyuan_Low_KBD']
-
-    df_final.to_csv(output_csv, index=False)
-    print(f"[+] Hindistan duyarlılık analizi tamamlandı: {output_csv}")
-    return True
-
-# ---------------------------------------------------------
-# 4. ÇİN ÖDEME DAĞILIMI (ENDONEZYA EKLENTİSİ & DİNAMİK ORANLAR)
-# ---------------------------------------------------------
-def process_china_payment_breakdown() -> bool:
-    print("[*] Çin ödeme birimi analizi (±%5 Duyarlılık Bandı ile) yapılıyor...")
-    input_file = os.path.join(PROCESSED_DIR, "china_oil_imports_processed.csv")
-    output_file = os.path.join(PROCESSED_DIR, "china_petrodolar_petroyuan_kbd.csv")
-
-    if not os.path.exists(input_file):
-        print("[!] Çin işlenmiş veri dosyası bulunamadı.")
-        return False
-
-    df = pd.read_csv(input_file)
-    df['Date'] = pd.to_datetime(df['Date of data'].astype(str).str.replace('-', '').str[:6], format='%Y%m',
-                                errors='coerce')
-    df = df.dropna(subset=['Date'])
-
-    # Vektörel Hacim Hesaplama (KBD)
-    df['Days'] = df['Date'].dt.daysinmonth
-    df['Vol_MT'] = np.where((df['Quantity'] == 0) & ('Supplementary Quantity' in df.columns),
-                            df['Supplementary Quantity'], df['Quantity'])
-    df['Vol_KBD'] = (df['Vol_MT'] * 7.33) / (1000000 * df['Days'])
-
-    # Ülke bazlı Pivot Tablo oluşturma
-    pivot_df = df.pivot_table(index='Date', columns='Trading partner', values='Vol_KBD', aggfunc='sum').fillna(0)
-
-    if 'World' not in pivot_df.columns:
-        pivot_df['World'] = pivot_df.sum(axis=1)
-
-    pivot_df['iran_venezuela'] = pivot_df.get('Iran', 0) + pivot_df.get('Venezuela', 0)
-
-    countries_map = {
-        'russia': 'Russia', 'malaysia': 'Malaysia', 'indonesia': 'Indonesia',
-        'saudi': 'Saudi Arabia', 'uae': 'United Arab Emirates', 'iraq': 'Iraq',
-        'oman': 'Oman', 'brazil': 'Brazil', 'iran_venezuela': 'iran_venezuela'
-    }
-
-    # Oranları matris tabanlı hesaplamak için yardımcı fonksiyon
-    def get_rates_df(dates, sensitivity=0.05):
-        rates = []
-        for d in dates:
-            y, q = d.year, (d.month - 1) // 3 + 1
-            # Örnek baz oranlar (Orijinal koddaki sözlüklerin özeti mantığıyla kurgulanmıştır)
-            # Gerçek veri setinizdeki quarterly_rates matrisi buraya map edilmelidir.
-            # Yerden tasarruf için örnek sabitler bırakılmıştır, kendi sözlüğünüzü vektörel mapping ile entegre edebilirsiniz.
-            rates.append({'Date': d})
-        return pd.DataFrame(rates)
-
-    # Not: Gerçek matris çarpımı için yukarıdaki quarterly_rates sözlüğünü pandas DataFrame'e çevirip joinleyebilirsiniz.
-    # Orijinal koddaki row-by-row yapı, hız optimizasyonu için burada dataframe mapping'e zorlanmalıdır.
-    # (Tam oran sözlüğü uzun olduğu için konsept vektörizasyon gösterilmiştir.)
-
-    print(f"[+] Çin duyarlılık analizi tamamlandı: {output_file}")
+    payment = compute_china_payment(imports, load_shares(ASSUMPTION_FILES["china"]))
+    atomic_write_csv(payment, FILES["china_payment"])
+    log.info("Çin: %d ay işlendi (%s – %s)", len(payment), payment.index.min().date(), payment.index.max().date())
     return True
 
 
-# ---------------------------------------------------------
-# 5. KÜRESEL HEGEMONYA BİRLEŞTİRME
-# ---------------------------------------------------------
-def global_ikili_hegemonya_birlestir() -> bool:
-    print("[*] Küresel Hegemonya Analizi (Hata Payı Bantları Dahil) yapılandırılıyor...")
+# =========================================================
+# 3. HİNDİSTAN (JODI toplam + DGCIS Rusya)
+# =========================================================
+def compute_dgcis_russia_kbd(dgcis: pd.DataFrame) -> pd.Series:
+    if dgcis.empty:
+        return pd.Series(dtype=float, index=pd.DatetimeIndex([], name="Date"), name="DGCIS_Rus_KBD")
 
-    try:
-        df_jodi = pd.read_csv(os.path.join(PROCESSED_DIR, "jodi_avrupa_asya_petrodolar.csv"), index_col=0,
-                              parse_dates=True)
-        df_abd = pd.read_csv(os.path.join(PROCESSED_DIR, "saf_abd_petrodolar.csv"), index_col=0, parse_dates=True)
+    df = dgcis.copy()
+    df["Date"] = pd.to_datetime(df["Period"], format="%b-%Y", errors="coerce")
+    df = df.dropna(subset=["Date"])
+    if df.empty:
+        return pd.Series(dtype=float, index=pd.DatetimeIndex([], name="Date"), name="DGCIS_Rus_KBD")
 
-        df_epdk = pd.read_csv(os.path.join(PROCESSED_DIR, "tr_epdk_master.csv"))
-        t_col = 'Tarih' if 'Tarih' in df_epdk.columns else 'tarih'
-        df_epdk[t_col] = pd.to_datetime(df_epdk[t_col])
-        df_epdk.set_index(t_col, inplace=True)
+    qty = df["Qty"].map(lambda v: parse_number(v, locale="en"))
+    unit = df["Unit"].astype(str).str.upper().str.strip() if "Unit" in df.columns else pd.Series("TON", df.index)
 
-        df_in = pd.read_csv(os.path.join(PROCESSED_DIR, "hindistan_nihai_hacim_analizi_kbd.csv"), index_col=0,
-                            parse_dates=True)
-        df_cn = pd.read_csv(os.path.join(PROCESSED_DIR, "china_petrodolar_petroyuan_kbd.csv"), index_col=0,
-                            parse_dates=True)
+    is_kg = unit.str.contains("KGS|KG")
+    is_ton = unit.str.contains("TON|MTS|^MT$", regex=True)
+    if (~(is_kg | is_ton)).any():
+        log.warning("DGCIS: tanınmayan birimler ton varsayıldı: %s", sorted(unit[~(is_kg | is_ton)].unique()))
+    tonnes = np.where(is_kg, qty / 1000.0, qty)
+    df["KBD"] = tonnes_to_kbd(tonnes, df["Date"])
+    return df.groupby("Date")["KBD"].sum(min_count=1).rename("DGCIS_Rus_KBD")
 
-        jodi_cols = [c for c in df_jodi.columns if c != 'Toplam_Avrupa_Asya_Petrodolar']
-        df_jodi[jodi_cols] = df_jodi[jodi_cols].replace(0, np.nan).ffill().fillna(0).div(df_jodi.index.daysinmonth,
-                                                                                         axis=0)
-        df_jodi['JODI_DIGER_KBD'] = df_jodi[[c for c in jodi_cols if c not in ['IN', 'IND', 'CN', 'CHN']]].sum(axis=1)
 
-        abd_col = 'ABD_Ithalat_KBD' if 'ABD_Ithalat_KBD' in df_abd.columns else df_abd.columns[0]
-        tr_col = 'TR_Toplam_Ithalat_KBD' if 'TR_Toplam_Ithalat_KBD' in df_epdk.columns else df_epdk.columns[0]
+def compute_india(jodi_kbd: pd.DataFrame, dgcis_rus: pd.Series, shares: pd.DataFrame) -> pd.DataFrame:
+    in_cols = [c for c in ("IN", "IND") if c in jodi_kbd.columns]
+    total = jodi_kbd[in_cols].sum(axis=1, min_count=1) if in_cols else pd.Series(np.nan, index=jodi_kbd.index)
+    df = pd.DataFrame({"Toplam_Ithalat_KBD": total}).join(dgcis_rus.rename("Rusya_Ithalat_KBD"), how="left")
+    df.index.name = "Date"
 
-        final_df = df_jodi[['JODI_DIGER_KBD']].join([
-            df_abd[[abd_col]], df_epdk[[tr_col]],
-            df_in[['Petrodolar_KBD', 'Petrodolar_High_KBD', 'Petrodolar_Low_KBD', 'Petroyuan_KBD', 'Petroyuan_High_KBD',
-                   'Petroyuan_Low_KBD']],
-            df_cn[
-                ['China_Petrodolar_KBD', 'China_Petrodolar_High_KBD', 'China_Petrodolar_Low_KBD', 'China_Petroyuan_KBD',
-                 'China_Petroyuan_High_KBD', 'China_Petroyuan_Low_KBD']]
-        ], how='inner').sort_index()
+    base = shares_for_dates(shares, df.index)["russia"].to_frame()
+    sc = share_scenarios(base)
+    rus = df["Rusya_Ithalat_KBD"]
+    # Pay 0 olan aylarda (2022 öncesi) DGCIS eksikliği sonucu etkilemez; pay > 0 iken eksikse NaN kalır.
+    no_effect = sc["_High"]["russia"].eq(0)
+    rus_eff = rus.where(rus.notna() | ~no_effect, 0.0)
 
-        # Vektörel Şart (Tarih bazlı)
-        pre_2021 = final_df.index < "2021-04-01"
-        for col in ['Petrodolar_KBD', 'Petrodolar_High_KBD', 'Petrodolar_Low_KBD', 'Petroyuan_KBD',
-                    'Petroyuan_High_KBD', 'Petroyuan_Low_KBD']:
-            final_df.loc[pre_2021, col] = 0.0
+    over = rus > df["Toplam_Ithalat_KBD"]
+    if over.any():
+        log.warning(
+            "Hindistan: %d ayda DGCIS Rusya ithalatı JODI toplamını aştı (%s); toplam ile sınırlandırılıyor.",
+            int(over.sum()),
+            ", ".join(pd.DatetimeIndex(df.index[over]).strftime("%Y-%m")[:6]),
+        )
 
-        # Vektörel Toplamlar
-        base_pd = final_df['JODI_DIGER_KBD'] + final_df[abd_col] + final_df[tr_col]
+    df["Rusya_Disi_KBD"] = (df["Toplam_Ithalat_KBD"] - rus).clip(lower=0)
+    cap = df["Toplam_Ithalat_KBD"]
+    for suffix, sh in sc.items():
+        raw_py = rus_eff * sh["russia"]
+        df[f"Petroyuan{suffix}_KBD"] = np.where(cap.notna(), np.minimum(raw_py, cap), raw_py)
+    df["Petrodolar_KBD"] = (df["Toplam_Ithalat_KBD"] - df["Petroyuan_KBD"]).clip(lower=0)
+    df["Petrodolar_High_KBD"] = (df["Toplam_Ithalat_KBD"] - df["Petroyuan_Low_KBD"]).clip(lower=0)
+    df["Petrodolar_Low_KBD"] = (df["Toplam_Ithalat_KBD"] - df["Petroyuan_High_KBD"]).clip(lower=0)
+    df["Alt_Share"] = base["russia"]
+    return df.round(3)
 
-        final_df['GLOBAL_PETRODOLAR'] = base_pd + final_df['China_Petrodolar_KBD'] + final_df['Petrodolar_KBD']
-        final_df['GLOBAL_PETROYUAN'] = final_df['China_Petroyuan_KBD'] + final_df['Petroyuan_KBD']
 
-        final_df['GLOBAL_PETROYUAN_High_KBD'] = final_df['China_Petroyuan_High_KBD'] + final_df['Petroyuan_High_KBD']
-        final_df['GLOBAL_PETROYUAN_Low_KBD'] = final_df['China_Petroyuan_Low_KBD'] + final_df[
-            'Petroyuan_Low_KBD']  # Hata düzeltildi
-
-        final_df['GLOBAL_PETRODOLAR_High_KBD'] = base_pd + final_df['China_Petrodolar_High_KBD'] + final_df[
-            'Petrodolar_High_KBD']
-        final_df['GLOBAL_PETRODOLAR_Low_KBD'] = base_pd + final_df['China_Petrodolar_Low_KBD'] + final_df[
-            'Petrodolar_Low_KBD']
-
-        final_df = final_df[(final_df['GLOBAL_PETRODOLAR'] > 1000) & (final_df.index >= "2018-01-01")]
-
-        output_master = os.path.join(PROCESSED_DIR, "GLOBAL_PETRODOLAR_VS_PETROYUAN.csv")
-        final_df.to_csv(output_master)
-        print(f"[+] Küresel Hegemonya Verisi (Hata Payı Bantlı) Kaydedildi: {output_master}")
-        return True
-    except Exception as e:
-        print(f"[!] Hata: {e}")
+def run_india() -> bool:
+    if not FILES["jodi"].exists():
+        log.warning("Hindistan: JODI dosyası yok.")
         return False
+    jodi = pd.read_csv(FILES["jodi"], index_col=0, parse_dates=True)
+    dgcis = pd.read_csv(FILES["dgcis"]) if FILES["dgcis"].exists() else pd.DataFrame(columns=["Period", "Qty"])
+    if dgcis.empty:
+        log.warning("Hindistan: DGCIS verisi yok; 2022 sonrası petroyuan NaN kalacak.")
+    df = compute_india(jodi, compute_dgcis_russia_kbd(dgcis), load_shares(ASSUMPTION_FILES["india"]))
+    atomic_write_csv(df, FILES["india"])
+    log.info("Hindistan: %d ay işlendi.", len(df))
+    return True
+
+
+# =========================================================
+# 4. KÜRESEL BİRLEŞTİRME + PANEL
+# =========================================================
+def compute_jodi_other(
+    jodi_kbd: pd.DataFrame,
+    required_coverage: float = JODI_REQUIRED_COVERAGE,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> pd.DataFrame:
+    """IN/CN/US/TR dışı JODI ülkelerinin dengeli (constant-basket) toplamı + kapsama kontrolü.
+
+    'Zorunlu' ülkeler: analiz penceresinde >= required_coverage oranında veri bildirenler.
+    Toplama yalnızca zorunlu ülkeler girer (düzensiz ülkelerin giriş-çıkışı sahte sıçrama
+    yaratmasın). Zorunlu ülkelerden biri bir ayda eksikse o ayın toplamı NaN olur.
+    """
+    cols = [c for c in jodi_kbd.columns if c not in JODI_EXCLUDED_FROM_OTHER]
+    sub = jodi_kbd[cols].sort_index()
+    window = sub.loc[start:end] if (start or end) else sub
+
+    coverage = window.notna().mean() if not window.empty else sub.notna().mean()
+    required = coverage[coverage >= required_coverage].index.tolist()
+
+    out = pd.DataFrame(index=sub.index)
+    if required:
+        complete = sub[required].notna().all(axis=1)
+        out["JODI_DIGER_KBD"] = sub[required].sum(axis=1, min_count=1).where(complete)
+        out["JODI_Reporting"] = sub[required].notna().sum(axis=1)
+    else:
+        out["JODI_DIGER_KBD"] = np.nan
+        out["JODI_Reporting"] = 0
+
+    dropped = sorted(set(cols) - set(required))
+    if dropped:
+        log.info("JODI: kapsama altında kalan düzensiz ülkeler hariç tutuldu: %s", dropped)
+    return out
+
+
+def compute_global(
+    jodi_kbd: pd.DataFrame,
+    us: pd.DataFrame,
+    tr: pd.DataFrame,
+    india: pd.DataFrame,
+    china: pd.DataFrame,
+    start: str = START_DATE,
+    end: str = END_DATE,
+) -> pd.DataFrame:
+    def monthly(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df.index = pd.to_datetime(df.index).to_period("M").to_timestamp()
+        return df.sort_index()[~df.sort_index().index.duplicated(keep="last")]
+
+    india_cols = [f"Petro{b}{s}_KBD" for b in ("dolar", "yuan") for s in SCENARIOS]
+    china_cols = [f"China_Petro{b}{s}_KBD" for b in ("dolar", "yuan") for s in SCENARIOS]
+
+    parts = [
+        monthly(compute_jodi_other(jodi_kbd, start=start, end=end)),
+        monthly(us[["ABD_Ithalat_KBD"]]),
+        monthly(tr[["TR_Toplam_Ithalat_KBD"]]),
+        monthly(india[india_cols]),
+        monthly(china[china_cols]),
+    ]
+    df = pd.concat(parts, axis=1, join="outer").sort_index().loc[start:end]
+    df.index.name = "Date"
+
+    needed = ["JODI_DIGER_KBD", "ABD_Ithalat_KBD", "TR_Toplam_Ithalat_KBD"] + india_cols + china_cols
+    incomplete = df[needed].isna().any(axis=1)
+    if incomplete.any():
+        missing = df.loc[incomplete, needed].isna()
+        summary = {d.strftime("%Y-%m"): list(missing.columns[missing.loc[d]]) for d in missing.index}
+        log.warning(
+            "Global: %d ay eksik bileşen nedeniyle örneklemden çıkarıldı: %s",
+            incomplete.sum(),
+            "; ".join(f"{k}: {','.join(v)}" for k, v in list(summary.items())[:12])
+            + (" ..." if len(summary) > 12 else ""),
+        )
+    df = df[~incomplete].copy()
+
+    base_pd = df["JODI_DIGER_KBD"] + df["ABD_Ithalat_KBD"] + df["TR_Toplam_Ithalat_KBD"]
+    for s in SCENARIOS:
+        df[f"GLOBAL_PETRODOLAR{s and s + '_KBD'}"] = (
+            base_pd + df[f"China_Petrodolar{s}_KBD"] + df[f"Petrodolar{s}_KBD"]
+        )
+        df[f"GLOBAL_PETROYUAN{s and s + '_KBD'}"] = df[f"China_Petroyuan{s}_KBD"] + df[f"Petroyuan{s}_KBD"]
+
+    df["GLOBAL_TOTAL_KBD"] = df["GLOBAL_PETRODOLAR"] + df["GLOBAL_PETROYUAN"]
+    df["PETROYUAN_SHARE_PCT"] = (df["GLOBAL_PETROYUAN"] / df["GLOBAL_TOTAL_KBD"] * 100).where(
+        df["GLOBAL_TOTAL_KBD"] > 0
+    )
+    return df.round(3)
+
+
+def compute_panel(
+    jodi_kbd: pd.DataFrame,
+    us: pd.DataFrame,
+    tr: pd.DataFrame,
+    india: pd.DataFrame,
+    china: pd.DataFrame,
+    start: str = START_DATE,
+    end: str = END_DATE,
+) -> pd.DataFrame:
+    """Panel ekonometri için uzun format: Date, region, petrodollar/petroyuan (baz/yüksek/düşük) + pay."""
+    frames: List[pd.DataFrame] = []
+
+    def add(
+        region: str,
+        pdol: pd.Series,
+        pyuan: Optional[pd.Series] = None,
+        extra: Optional[Dict[str, pd.Series]] = None,
+    ) -> None:
+        idx = pd.to_datetime(pdol.index).to_period("M").to_timestamp()
+        f = pd.DataFrame({"petrodollar_kbd": pdol.to_numpy()}, index=idx)
+        f = f[~f.index.duplicated(keep="last")]
+        if pyuan is None:
+            f["petroyuan_kbd"] = 0.0
+        else:
+            py_aligned = pd.Series(
+                pyuan.to_numpy(),
+                index=pd.to_datetime(pyuan.index).to_period("M").to_timestamp(),
+            )
+            py_aligned = py_aligned[~py_aligned.index.duplicated(keep="last")]
+            f["petroyuan_kbd"] = py_aligned.reindex(f.index)
+        for k, v in (extra or {}).items():
+            v_aligned = pd.Series(
+                v.to_numpy(),
+                index=pd.to_datetime(v.index).to_period("M").to_timestamp(),
+            )
+            v_aligned = v_aligned[~v_aligned.index.duplicated(keep="last")]
+            f[k] = v_aligned.reindex(f.index)
+        f["region"] = region
+        frames.append(f)
+
+    for c in jodi_kbd.columns:
+        if c not in JODI_EXCLUDED_FROM_OTHER:
+            add(c, jodi_kbd[c])
+    add("US", us["ABD_Ithalat_KBD"])
+    add("TR", tr["TR_Toplam_Ithalat_KBD"])
+    add(
+        "IN",
+        india["Petrodolar_KBD"],
+        india["Petroyuan_KBD"],
+        {"petroyuan_high_kbd": india["Petroyuan_High_KBD"], "petroyuan_low_kbd": india["Petroyuan_Low_KBD"]},
+    )
+    add(
+        "CN",
+        china["China_Petrodolar_KBD"],
+        china["China_Petroyuan_KBD"],
+        {
+            "petroyuan_high_kbd": china["China_Petroyuan_High_KBD"],
+            "petroyuan_low_kbd": china["China_Petroyuan_Low_KBD"],
+        },
+    )
+
+    panel = pd.concat(frames).sort_index()
+    panel.index.name = "Date"
+    panel = panel.loc[start:end].reset_index()
+    panel["total_kbd"] = panel["petrodollar_kbd"] + panel["petroyuan_kbd"]
+    panel["petroyuan_share_pct"] = np.where(
+        panel["total_kbd"] > 0, panel["petroyuan_kbd"] / panel["total_kbd"] * 100.0, np.nan
+    )
+    for col in ("petroyuan_high_kbd", "petroyuan_low_kbd"):
+        panel[col] = panel[col].fillna(panel["petroyuan_kbd"])
+    out = (
+        panel.dropna(subset=["petrodollar_kbd", "petroyuan_kbd"])
+        .sort_values(["region", "Date"])
+        .reset_index(drop=True)
+    )
+    num_cols = out.select_dtypes(include="number").columns
+    out[num_cols] = out[num_cols].round(3)
+    return out
+
+
+def run_global() -> bool:
+    req = ["jodi", "eia", "epdk", "india", "china_payment"]
+    if missing := [k for k in req if not FILES[k].exists()]:
+        log.error("Global birleştirme için eksik dosyalar: %s", [FILES[k].name for k in missing])
+        return False
+
+    jodi = pd.read_csv(FILES["jodi"], index_col=0, parse_dates=True)
+    us = pd.read_csv(FILES["eia"], index_col=0, parse_dates=True)
+    tr = _read_epdk().set_index("Tarih")
+    india = pd.read_csv(FILES["india"], index_col=0, parse_dates=True)
+    china = pd.read_csv(FILES["china_payment"], index_col=0, parse_dates=True)
+
+    g = compute_global(jodi, us, tr, india, china)
+    atomic_write_csv(g, FILES["global"])
+    atomic_write_csv(compute_panel(jodi, us, tr, india, china), FILES["panel"], index=False)
+    if g.empty:
+        log.error("Global seri boş: bileşenlerin ortak dönemi yok.")
+        return False
+    log.info("Global seri: %d ay (%s – %s)", len(g), g.index.min().date(), g.index.max().date())
+    return True
+
+
+def run_all() -> Dict[str, bool]:
+    results = {}
+    for name, fn in (
+        ("turkey", run_turkey_master),
+        ("china", run_china),
+        ("india", run_india),
+        ("global", run_global),
+    ):
+        try:
+            results[name] = fn() is not False
+        except Exception:  # noqa: BLE001 - bir alt adımın hatası diğerlerini durdurmamalı
+            log.exception("Transform/%s başarısız", name)
+            results[name] = False
+    return results
